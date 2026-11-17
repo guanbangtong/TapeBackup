@@ -37,12 +37,13 @@ import shutil
 import sqlite3
 import tarfile
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable
 
-from . import db
+from . import db, source_cleanup
 from .config import Config
 from .copier import (
     PART_SUFFIX,
@@ -63,7 +64,8 @@ TAR_END_OVERHEAD = 2 * tarfile.RECORDSIZE  # end-of-archive blocks plus padding 
 MAX_ATTEMPTS = 3
 MTIME_TOLERANCE = 2.0  # seconds; file systems round modification times differently
 
-PHASES = ("scan", "stage", "tape", "verify", "cleanup")
+# "delete" (optional, per job): wait, then remove the NAS source. Its unit is "seconds" while waiting.
+PHASES = ("scan", "stage", "tape", "verify", "cleanup", "delete")
 
 EJECT_REMINDER = "取出磁带前，请先在 LTFS 软件里正常弹出磁带，确保内容已完整写入。"
 
@@ -253,24 +255,28 @@ class Engine:
         except (OSError, sqlite3.Error) as e:
             return "error", f"无法打开记录数据库或中转目录：{e}"
         try:
+            pending = db.pending_deletions(self.con)  # backed up earlier, source not deleted yet
             jobs = db.active_jobs(self.con)
-            if not jobs:
+            if not jobs and not pending:
                 return "done", "队列里没有需要备份的任务。"
             failed = 0
             skipped: list[str] = []
-            for job in jobs:
+            for job in pending + jobs:
                 try:
-                    failed += self._run_job(job)
+                    if job["status"] == "DONE":
+                        self._delete_source(job)
+                    else:
+                        failed += self._run_job(job)
                 except JobError as e:  # this job cannot run; the others still can
                     self.log(f"任务 {job['owner']} 未完成：{e}")
                     skipped.append(f"{job['owner']}：{e}")
+            total = len(pending) + len(jobs)
             if skipped:
-                done = len(jobs) - len(skipped)
                 return "error", (
-                    f"{len(skipped)} 个任务未完成（其余 {done} 个已完成）。问题解决后重新点击开始即可继续：\n\n"
-                    + "\n".join(skipped)
+                    f"{len(skipped)} 个任务未完成（其余 {total - len(skipped)} 个已完成）。"
+                    "问题解决后重新点击开始即可继续：\n\n" + "\n".join(skipped)
                 )
-            message = f"全部完成，共 {len(jobs)} 个任务。"
+            message = f"全部完成，共 {total} 个任务。"
             if failed:
                 message += f"\n有 {failed} 个文件未能备份，可在“记录”页查看。"
             return "done", f"{message}\n\n{EJECT_REMINDER}"
@@ -382,7 +388,9 @@ class Engine:
             self._cleanup(job, batch)
             self._notify(job_id)
 
-        return self._finish(job)
+        failed = self._finish(job)
+        self._delete_source(job)
+        return failed
 
     def _check_job(self, job: sqlite3.Row) -> None:
         """Refuse a job whose name or source folder would make the program work on its own files."""
@@ -996,6 +1004,134 @@ class Engine:
         prune_empty_dirs(stage_root)
         with con:
             con.execute("UPDATE batches SET cleaned=1 WHERE id=?", (batch["id"],))
+
+    # ------------------------------------------------------------ delete the NAS source
+
+    def _delete_source(self, job: sqlite3.Row) -> None:
+        """For a finished job that asked for it: delete from the NAS what is safely on tape.
+
+        The rules for what may be deleted are in source_cleanup. This method adds the conditions:
+        the job is DONE, the waiting time since the last tape write has passed (LTFS writes its
+        index to the tape periodically; before that a power cut could lose what was just written),
+        and the files on the tape that is in the drive are checked once more.
+        """
+        con = self.con
+        job = con.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
+        if job is None or job["status"] != "DONE" or not job["delete_source"] or job["source_deleted_at"]:
+            return
+        job_id, owner, source = job["id"], job["owner"], job["source_path"]
+        p = self.progress
+        p.job_id, p.owner = job_id, owner
+        if not os.path.isdir(long_path(source)):
+            self.log(f"{owner}：源文件夹 {source} 已经不存在，无需删除。")
+            self._record_deletion(job_id, 0, 0, 0)
+            return
+        self._check_job(job)  # never delete inside the staging folder, the tape or the records folder
+
+        # 1. Wait until the tape has had time to write its index.
+        last = con.execute(
+            "SELECT MAX(b.archived_at) FROM batches b JOIN jobs j ON j.id=b.job_id "
+            "WHERE j.owner=? COLLATE NOCASE AND j.legacy=0",
+            (owner,),
+        ).fetchone()[0]
+        delay = max(0.0, self.cfg.delete_delay_minutes * 60)
+        if last and delay:
+            since = time.time() - datetime.strptime(last, "%Y-%m-%d %H:%M:%S").timestamp()
+            wait = min(delay, max(0.0, delay - since))  # never longer than the delay, whatever the clock says
+            if wait > 0:
+                self.log(f"{owner}：等待 {math.ceil(wait / 60)} 分钟让磁带机把目录写入磁带，之后删除 NAS 源数据。")
+                with p._lock:
+                    p.phase, p.phase_unit = "delete", "seconds"
+                    p.phase_total, p.phase_done = int(delay), int(delay - wait)
+                    p.current_file = ""
+                deadline = time.monotonic() + wait
+                while (left := deadline - time.monotonic()) > 0:
+                    self._check_stop()
+                    p.phase_done = int(delay - left)
+                    time.sleep(min(0.2, left))
+
+        # 2. Decide file by file, then check the tape in the drive once more.
+        with p._lock:
+            p.phase, p.phase_unit = "delete", "files"
+            p.phase_total = p.phase_done = 0
+            p.current_file = ""
+        self.log(f"{owner}：核对 NAS 上的文件与备份记录 ...")
+        candidates, kept = source_cleanup.plan_deletion(con, owner, source, self._stop.is_set)
+        problems = self._recheck_on_tape(owner, candidates)
+        if problems:
+            raise EngineError(
+                f"磁带上有 {len(problems)} 个文件与备份记录不符（例如 {problems[0]}），"
+                f"所以没有删除 {source} 里的任何数据。请检查磁带后重新点击开始。"
+            )
+
+        # 3. Delete, then empty the NAS recycle folder of this source so the space is really freed.
+        p.phase_total = len(candidates)
+
+        def on_file(rel_path: str) -> None:
+            p.current_file = rel_path
+            p.step()
+
+        self.log(f"{owner}：删除 NAS 上已备份的 {len(candidates)} 个文件 ...")
+        deleted, deleted_bytes, not_deleted = source_cleanup.delete_files(
+            source, candidates, self._stop.is_set, on_file
+        )
+        kept += not_deleted
+        recycle = source_cleanup.recycle_path(source, self.cfg.nas_recycle_dir)
+        if recycle and os.path.isdir(long_path(recycle)):
+            p.current_file = recycle
+            files, size, errors = source_cleanup.purge_tree(recycle, self._stop.is_set)
+            text = f"{owner}：已清空 NAS 回收站 {recycle}（{files} 个文件，{format_bytes(size)}）"
+            self.log(text + (f"；{errors} 项无法删除" if errors else ""))
+
+        self._record_deletion(job_id, deleted, deleted_bytes, len(kept))
+        text = f"{owner}：已删除 NAS 源数据 {deleted} 个文件，{format_bytes(deleted_bytes)}"
+        if kept:
+            text += f"；{len(kept)} 个文件不在磁带上或已改动，保留在 {source}"
+        self.log(text)
+        for rel_path, reason in kept[:20]:
+            self.log(f"    保留：{rel_path}（{reason}）")
+        if len(kept) > 20:
+            self.log(f"    …… 另有 {len(kept) - 20} 个")
+
+    def _recheck_on_tape(self, owner: str, candidates: list[source_cleanup.Candidate]) -> list[str]:
+        """Files recorded on the tape that is in the drive must really be there. Returns the ones that are not."""
+        root = self.cfg.tape_root
+        try:
+            marker = read_tape_marker(root) if os.path.isdir(root) else None
+        except OSError:
+            marker = None
+        here = [c for c in candidates if marker and c.tape_id == marker]
+        tar_ok: dict[int, bool] = {}
+        problems = []
+        for item in here:
+            self._check_stop()
+            if item.kind == "raw":
+                ok = _size(raw_media_path(root, owner, item.rel_path)) == item.size
+            else:
+                if item.batch_id not in tar_ok:
+                    batch = self._batch(item.batch_id)
+                    tar_ok[item.batch_id] = bool(
+                        batch is not None and item.tar_name and batch["tar_size"] is not None
+                        and _size(tar_media_path(root, owner, item.tar_name)) == batch["tar_size"]
+                    )
+                ok = tar_ok[item.batch_id]
+            if not ok:
+                problems.append(item.rel_path)
+        elsewhere = len(candidates) - len(here)
+        if here:
+            text = f"{owner}：已在磁带 {marker} 上重新核对 {len(here)} 个文件"
+            self.log(text + (f"；另有 {elsewhere} 个文件在其他磁带上，按备份记录处理" if elsewhere else ""))
+        elif candidates:
+            self.log(f"{owner}：这些文件所在的磁带不在磁带机里，按备份记录处理。")
+        return problems
+
+    def _record_deletion(self, job_id: int, files: int, size: int, kept: int) -> None:
+        with self.con:
+            self.con.execute(
+                "UPDATE jobs SET source_deleted_at=?, deleted_files=?, deleted_bytes=?, kept_files=? WHERE id=?",
+                (db.now(), files, size, kept, job_id),
+            )
+        self._notify(job_id)
 
     # ------------------------------------------------------------ tape handling
 

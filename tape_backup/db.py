@@ -34,7 +34,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     total_bytes  INTEGER NOT NULL DEFAULT 0,
     done_files   INTEGER NOT NULL DEFAULT 0, -- archived on tape
     done_bytes   INTEGER NOT NULL DEFAULT 0,
-    failed_files INTEGER NOT NULL DEFAULT 0
+    failed_files INTEGER NOT NULL DEFAULT 0,
+    delete_source     INTEGER NOT NULL DEFAULT 0, -- 1 = delete the NAS source once the backup is complete
+    source_deleted_at TEXT,                       -- set when that deletion has been done
+    deleted_files     INTEGER NOT NULL DEFAULT 0,
+    deleted_bytes     INTEGER NOT NULL DEFAULT 0,
+    kept_files        INTEGER NOT NULL DEFAULT 0  -- files left on the NAS because they are not (or no longer) on tape
 );
 
 CREATE TABLE IF NOT EXISTS batches (
@@ -76,6 +81,19 @@ CREATE INDEX IF NOT EXISTS idx_batches_job ON batches(job_id);
 """
 
 
+# Columns added after the first release: (table, column, definition). A database created by an
+# older version gets them on open, so nobody has to delete their records to upgrade.
+ADDED_COLUMNS = (
+    ("batches", "tar_written", "TEXT"),
+    ("files", "written", "TEXT"),
+    ("jobs", "delete_source", "INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "source_deleted_at", "TEXT"),
+    ("jobs", "deleted_files", "INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "deleted_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "kept_files", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
 def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -88,20 +106,39 @@ def connect(db_path: str) -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode=WAL")    # UI can read while the engine writes
     con.execute("PRAGMA synchronous=NORMAL")
     con.executescript(SCHEMA)
+    for table, column, definition in ADDED_COLUMNS:
+        if column not in {row["name"] for row in con.execute(f"PRAGMA table_info({table})")}:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
     con.commit()
     return con
 
 
 # ---------------------------------------------------------------- queue
 
-def add_job(con: sqlite3.Connection, owner: str, source_path: str) -> int:
+def add_job(con: sqlite3.Connection, owner: str, source_path: str, delete_source: bool = False) -> int:
     cur = con.execute(
-        "INSERT INTO jobs(owner, source_path, status, created_at) VALUES (?,?, 'QUEUED', ?)",
-        (owner, source_path, now()),
+        "INSERT INTO jobs(owner, source_path, status, created_at, delete_source) VALUES (?,?, 'QUEUED', ?, ?)",
+        (owner, source_path, now(), int(delete_source)),
     )
     con.commit()
     assert cur.lastrowid is not None
     return cur.lastrowid
+
+
+def set_delete_source(con: sqlite3.Connection, job_id: int, delete_source: bool) -> None:
+    """Switch 'delete the NAS source after backup' for a job whose source has not been deleted yet."""
+    con.execute(
+        "UPDATE jobs SET delete_source=? WHERE id=? AND source_deleted_at IS NULL", (int(delete_source), job_id)
+    )
+    con.commit()
+
+
+def pending_deletions(con: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Finished jobs whose NAS source is still waiting to be deleted (the run was stopped before it happened)."""
+    return con.execute(
+        "SELECT * FROM jobs WHERE status='DONE' AND legacy=0 AND delete_source=1 AND source_deleted_at IS NULL "
+        "ORDER BY id"
+    ).fetchall()
 
 
 def remove_queued_job(con: sqlite3.Connection, job_id: int) -> bool:
@@ -117,6 +154,12 @@ def active_jobs(con: sqlite3.Connection) -> list[sqlite3.Row]:
         "SELECT * FROM jobs WHERE status IN ('RUNNING','QUEUED') AND legacy=0 "
         "ORDER BY (status='RUNNING') DESC, id"
     ).fetchall()
+
+
+def queue_jobs(con: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Everything the next run will work on: finished jobs still waiting for their source to be
+    deleted, then unfinished jobs, then queued ones."""
+    return pending_deletions(con) + active_jobs(con)
 
 
 def owner_history(con: sqlite3.Connection, owner: str) -> dict:

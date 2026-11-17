@@ -7,12 +7,10 @@ import sqlite3
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
-    QLabel,
     QMessageBox,
     QPushButton,
     QTableWidget,
@@ -24,8 +22,9 @@ from PySide6.QtWidgets import (
 from . import db
 from .config import Config
 from .copier import format_bytes
+from .ui_style import label, page_margins, setup_table, status_item
 
-HEADERS = ["日期", "名称", "磁带号", "大小", "文件数", "批次", "状态", "源文件夹"]
+HEADERS = ["日期", "名称", "磁带号", "大小", "文件数", "批次", "状态", "NAS 源数据", "源文件夹"]
 LEGACY_COLUMNS = {"date", "tape_id", "owner", "size_tb"}
 
 
@@ -42,24 +41,41 @@ class NumItem(QTableWidgetItem):
 
 
 def status_text(job: sqlite3.Row) -> str:
+    return status_cell(job)[1]
+
+
+def status_cell(job: sqlite3.Row) -> tuple[str, str]:
     if job["legacy"]:
-        return "旧记录"
+        return "wait", "旧记录"
     s = job["status"]
     if s == "DONE":
-        return f"完成（{job['failed_files']} 个文件失败）" if job["failed_files"] > 0 else "完成"
-    return {"RUNNING": "未完成", "QUEUED": "等待中", "CANCELLED": "已放弃"}.get(s, s)
+        if job["failed_files"] > 0:
+            return "warn", f"完成，{job['failed_files']} 个文件失败"
+        return "ok", "完成"
+    kind, text = {"RUNNING": ("run", "未完成"), "QUEUED": ("wait", "等待中"), "CANCELLED": ("wait", "已放弃")}.get(s, ("wait", s))
+    return kind, text
 
 
-def make_table(headers: list[str]) -> QTableWidget:
+def source_cell(job: sqlite3.Row) -> tuple[str, str, str]:
+    """(kind, text, tooltip) for the NAS source column; kind is '' for an empty cell."""
+    if job["source_deleted_at"]:
+        tip = (f"删除了 {job['deleted_files']} 个文件，{format_bytes(job['deleted_bytes'])}；"
+               f"保留 {job['kept_files']} 个（备份后新增或改动过）\n"
+               f"{job['source_deleted_at']}")
+        return "ok", "已删除", tip
+    if job["delete_source"] == 1:
+        return "warn", "待删除", ""
+    return "", "", ""
+
+
+def source_text(job: sqlite3.Row) -> str:
+    return source_cell(job)[1]
+
+
+def make_table(headers: list[str], multi_select: bool = False) -> QTableWidget:
     t = QTableWidget(0, len(headers))
     t.setHorizontalHeaderLabels(headers)
-    t.setEditTriggers(QAbstractItemView.NoEditTriggers)
-    t.setSelectionBehavior(QAbstractItemView.SelectRows)
-    t.verticalHeader().setVisible(False)
-    t.verticalHeader().setDefaultSectionSize(28)
-    t.setAlternatingRowColors(True)
-    t.setWordWrap(False)
-    t.horizontalHeader().setStretchLastSection(True)
+    setup_table(t, multi_select=multi_select)
     return t
 
 
@@ -68,21 +84,32 @@ class RecordsPage(QWidget):
 
     def __init__(self, cfg: Config, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("page")
         self.cfg = cfg
         self.con: sqlite3.Connection | None = None
         self.db_path = ""
         self.jobs: list[sqlite3.Row] = []
 
         self.table = make_table(HEADERS)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setSortingEnabled(True)
-        for col, width in enumerate([150, 120, 100, 90, 80, 60, 150]):
-            self.table.setColumnWidth(col, width)
+        header = self.table.horizontalHeader()
+        for col in range(len(HEADERS) - 1):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(len(HEADERS) - 1, QHeaderView.Interactive)
+        header.setStretchLastSection(True)  # source folder takes the rest, never below 160 px
+        self.table.setColumnWidth(len(HEADERS) - 1, 160)
+        header.setMinimumSectionSize(60)
+        for col in (3, 4, 5):  # numeric columns: header aligned with the right-aligned figures
+            self.table.horizontalHeaderItem(col).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.tape_table = make_table(["磁带号", "已写入", "最近使用"])
         self.tape_table.setSortingEnabled(True)
-        self.tape_table.setMaximumHeight(170)
-        self.tape_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        tape_header = self.tape_table.horizontalHeader()
+        tape_header.setStretchLastSection(False)
+        tape_header.setSectionResizeMode(0, QHeaderView.Stretch)
+        tape_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        tape_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.tape_table.horizontalHeaderItem(1).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.refresh_button = QPushButton("刷新")
         self.import_button = QPushButton("导入旧记录…")
@@ -92,23 +119,33 @@ class RecordsPage(QWidget):
         self.failed_button.setEnabled(False)
         self.restore_button.setEnabled(False)
 
-        buttons = QHBoxLayout()
-        for b in (self.refresh_button, self.import_button, self.export_button):
-            buttons.addWidget(b)
-        buttons.addStretch(1)
-        buttons.addWidget(self.failed_button)
-        buttons.addWidget(self.restore_button)
+        self.status = label("", "hint")
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        top.addWidget(label("备份记录", "title"))
+        top.addSpacing(4)
+        top.addWidget(self.status)
+        top.addStretch(1)
+        for b in (self.refresh_button, self.import_button, self.export_button, self.failed_button, self.restore_button):
+            top.addWidget(b)
 
-        self.status = QLabel("")
-        self.status.setProperty("hint", True)
-        tape_title = QLabel("磁带一览")
+        side = QWidget()
+        side.setFixedWidth(300)
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(8)
+        side_layout.addWidget(label("磁带一览", "title"))
+        side_layout.addWidget(self.tape_table, 1)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        body.addWidget(self.table, 1)
+        body.addWidget(side)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(buttons)
-        layout.addWidget(self.table, 1)
-        layout.addWidget(self.status)
-        layout.addWidget(tape_title)
-        layout.addWidget(self.tape_table)
+        page_margins(layout)
+        layout.addLayout(top)
+        layout.addLayout(body, 1)
 
         self.refresh_button.clicked.connect(self.refresh)
         self.import_button.clicked.connect(lambda: self.import_legacy())
@@ -144,7 +181,7 @@ class RecordsPage(QWidget):
         t.setSortingEnabled(False)
         t.setRowCount(len(self.jobs))
         for i, j in enumerate(self.jobs):
-            stamp = j["finished_at"] or j["created_at"]
+            stamp = (j["finished_at"] or j["created_at"])[:16]  # no seconds
             files = "—" if j["legacy"] else str(j["done_files"])
             cells = [
                 QTableWidgetItem(stamp),
@@ -153,11 +190,16 @@ class RecordsPage(QWidget):
                 NumItem(format_bytes(j["done_bytes"]), j["done_bytes"]),
                 NumItem(files, -1 if j["legacy"] else j["done_files"]),
                 NumItem(str(j["batch_count"]), j["batch_count"]),
-                QTableWidgetItem(status_text(j)),
+                status_item(*status_cell(j)),
+                QTableWidgetItem(),
                 QTableWidgetItem(j["source_path"]),
             ]
+            kind, text, tip = source_cell(j)
+            if kind:
+                cells[7] = status_item(kind, text)
+                cells[7].setToolTip(tip)
             cells[0].setData(Qt.UserRole, i)  # index into self.jobs, survives sorting
-            cells[7].setToolTip(j["source_path"])
+            cells[8].setToolTip(j["source_path"])
             for col, item in enumerate(cells):
                 t.setItem(i, col, item)
         t.setSortingEnabled(True)
@@ -174,10 +216,10 @@ class RecordsPage(QWidget):
         for i, r in enumerate(tapes):
             tt.setItem(i, 0, QTableWidgetItem(r["tape_id"]))
             tt.setItem(i, 1, NumItem(format_bytes(r["bytes"] or 0), r["bytes"] or 0))
-            tt.setItem(i, 2, QTableWidgetItem(r["last_used"] or ""))
+            tt.setItem(i, 2, QTableWidgetItem((r["last_used"] or "")[:10]))
         tt.setSortingEnabled(True)
 
-        self.status.setText(f"共 {len(self.jobs)} 条备份记录，{len(tapes)} 盘磁带")
+        self.status.setText(f"共 {len(self.jobs)} 条，{len(tapes)} 盘磁带")
         self._selection_changed()
 
     def selected_job(self) -> sqlite3.Row | None:
@@ -229,7 +271,7 @@ class RecordsPage(QWidget):
                 for j in self.jobs:
                     w.writerow([
                         j["finished_at"] or j["created_at"], j["owner"], j["tapes"] or "", j["done_bytes"],
-                        "" if j["legacy"] else j["done_files"], j["batch_count"], status_text(j), j["source_path"],
+                        "" if j["legacy"] else j["done_files"], j["batch_count"], status_text(j), source_text(j), j["source_path"],
                     ])
         except OSError as e:
             QMessageBox.warning(self, "导出", f"无法写入文件：\n{e}")
@@ -248,13 +290,17 @@ class RecordsPage(QWidget):
             table.setItem(i, 0, QTableWidgetItem(r["rel_path"]))
             table.setItem(i, 1, NumItem(format_bytes(r["size"]), r["size"]))
             table.setItem(i, 2, QTableWidgetItem(r["error"] or ""))
-        table.setColumnWidth(0, 400)
-        table.setColumnWidth(1, 90)
+        fh = table.horizontalHeader()
+        fh.setStretchLastSection(False)
+        fh.setSectionResizeMode(0, QHeaderView.Stretch)
+        fh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        fh.setSectionResizeMode(2, QHeaderView.Stretch)
         close = QPushButton("关闭")
         close.clicked.connect(dlg.accept)
-        note = QLabel(f"共 {len(rows)} 个文件没有备份成功（读取失败）。这些文件不在磁带上。")
-        note.setProperty("hint", True)
+        note = label(f"共 {len(rows)} 个文件没有备份成功（读取失败）。这些文件不在磁带上。", "hint")
         layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
         layout.addWidget(note)
         layout.addWidget(table, 1)
         layout.addWidget(close, 0, Qt.AlignRight)

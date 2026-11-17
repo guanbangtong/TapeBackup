@@ -7,12 +7,10 @@ import sqlite3
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
-    QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
@@ -25,10 +23,13 @@ from PySide6.QtWidgets import (
 from . import db
 from .config import Config
 from .copier import format_bytes
+from .ui_style import label, page_margins, setup_table
 
 LIMIT = 2000
 ALL = "全部"
 HEADERS = ["文件", "大小", "名称", "磁带号", "备份时间", "存放方式"]
+EMPTY_BEFORE = "输入关键字查找文件在哪盘磁带上"
+EMPTY_NO_HITS = "没有找到匹配的文件，换个关键字试试"
 
 
 class SizeItem(QTableWidgetItem):
@@ -44,12 +45,13 @@ class SizeItem(QTableWidgetItem):
 
 
 def placement(row: sqlite3.Row) -> str:
-    return "直接存放" if row["kind"] == "raw" else f"打包在 {row['tar_name']}"
+    return "直接存放" if row["kind"] == "raw" else "tar 包"
 
 
 class SearchPage(QWidget):
     def __init__(self, cfg: Config, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("page")
         self.cfg = cfg
         self.con: sqlite3.Connection | None = None
         self.db_path = ""
@@ -65,31 +67,32 @@ class SearchPage(QWidget):
         self.search_button.setProperty("primary", True)
 
         top = QHBoxLayout()
+        top.setSpacing(8)
         top.addWidget(self.keyword, 1)
-        top.addWidget(QLabel("名称"))
+        top.addSpacing(8)
+        top.addWidget(label("名称", "hint"))
         top.addWidget(self.owner_box)
-        top.addWidget(QLabel("磁带"))
+        top.addSpacing(4)
+        top.addWidget(label("磁带", "hint"))
         top.addWidget(self.tape_box)
+        top.addSpacing(8)
         top.addWidget(self.search_button)
 
         self.table = QTableWidget(0, len(HEADERS))
         self.table.setHorizontalHeaderLabels(HEADERS)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(28)
+        setup_table(self.table, multi_select=True)
         self.table.setSortingEnabled(True)
-        self.table.setAlternatingRowColors(True)
-        self.table.setWordWrap(False)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setStretchLastSection(True)
-        for col, width in enumerate([420, 90, 120, 90, 150]):
-            self.table.setColumnWidth(col, width)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in range(1, len(HEADERS)):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
 
-        self.status = QLabel("")
-        self.status.setProperty("hint", True)
+        self.table.horizontalHeaderItem(1).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.empty_label = label(EMPTY_BEFORE, "hint")
+        self.empty_label.setAlignment(Qt.AlignCenter)
+
+        self.status = label("", "hint")
         self.export_button = QPushButton("导出 CSV…")
         self.restore_button = QPushButton("取回选中的文件…")
         self.restore_button.setEnabled(False)
@@ -100,9 +103,12 @@ class SearchPage(QWidget):
         bottom.addWidget(self.restore_button)
 
         layout = QVBoxLayout(self)
+        page_margins(layout)
         layout.addLayout(top)
         layout.addWidget(self.table, 1)
+        layout.addWidget(self.empty_label, 1)
         layout.addLayout(bottom)
+        self._show_empty(EMPTY_BEFORE)
 
         self.search_button.clicked.connect(self.search)
         self.keyword.returnPressed.connect(self.search)
@@ -154,6 +160,13 @@ class SearchPage(QWidget):
             return
         self._fill()
 
+    def _show_empty(self, text: str | None) -> None:
+        """Show the grey message instead of the table while there is nothing to list."""
+        self.empty_label.setVisible(text is not None)
+        self.table.setVisible(text is None)
+        if text is not None:
+            self.empty_label.setText(text)
+
     def _fill(self) -> None:
         self.table.setSortingEnabled(False)  # keep row indexes stable while filling
         self.table.setRowCount(len(self.rows))
@@ -168,9 +181,12 @@ class SearchPage(QWidget):
             ]
             cells[0].setData(Qt.UserRole, i)  # index into self.rows, survives sorting
             cells[0].setToolTip(r["rel_path"])
+            if r["kind"] != "raw":
+                cells[5].setToolTip(f"打包在 {r['tar_name']}")
             for col, item in enumerate(cells):
                 self.table.setItem(i, col, item)
         self.table.setSortingEnabled(True)
+        self._show_empty(None if self.rows else EMPTY_NO_HITS)
         text = f"找到 {len(self.rows)} 个文件"
         if len(self.rows) >= LIMIT:
             text += f"。只显示前 {LIMIT} 个，请输入更具体的关键字缩小范围。"
@@ -205,10 +221,10 @@ class SearchPage(QWidget):
         try:
             with open(path, "w", encoding="utf-8-sig", newline="") as f:  # BOM so Excel reads Chinese correctly
                 w = csv.writer(f)
-                w.writerow(HEADERS + ["sha256"])
+                w.writerow(HEADERS + ["tar 文件", "sha256"])
                 for r in self.rows:
                     w.writerow([r["rel_path"], r["size"], r["owner"], r["tape_id"], r["archived_at"],
-                                placement(r), r["sha256"] or ""])
+                                placement(r), r["tar_name"] if r["kind"] != "raw" else "", r["sha256"] or ""])
         except OSError as e:
             QMessageBox.warning(self, "导出", f"无法写入文件：\n{e}")
             return False

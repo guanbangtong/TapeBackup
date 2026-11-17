@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QHBoxLayout,
-    QLabel,
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
@@ -28,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from .config import Config
 from .copier import format_bytes
+from .ui_style import label, page_margins, set_prop
 from .restore import Restorer, plan_tapes
 
 PROGRESS_STEPS = 1000  # byte counts exceed 32 bits, so the bar works on a fixed integer range
@@ -47,41 +47,39 @@ class RestoreDialog(QDialog):
         self._answer_ready = threading.Event()
         self._answer = False
 
+        self.setObjectName("page")
         self.setWindowTitle("从磁带取回文件")
         self.setMinimumWidth(680)
         self.resize(720, 640)
 
         total = sum(int(f["size"] or 0) for f in self.files)
         tapes = plan_tapes(self.files)
-        summary = QLabel(f"将取回 {len(self.files)} 个文件，共 {format_bytes(total)}。")
-        font = summary.font()
-        font.setBold(True)
-        summary.setFont(font)
+        summary = label(f"将取回 {len(self.files)} 个文件，共 {format_bytes(total)}", "title")
         tape_lines = [f"{i}. {tape_id or '（记录里没有磁带号）'}：{count} 个文件" for i, (tape_id, count) in enumerate(tapes, 1)]
-        tape_label = QLabel("需要的磁带（按取回顺序）：\n" + "\n".join(tape_lines))
-        tape_label.setProperty("hint", "true")
+        tape_label = label("需要的磁带（按取回顺序）\n" + "\n".join(tape_lines), "hint")
 
         self.dest_edit = QLineEdit()
         self.dest_edit.setPlaceholderText("选择要保存到的文件夹")
         self.browse_button = QPushButton("浏览…")
         self.browse_button.clicked.connect(self._browse)
         dest_row = QHBoxLayout()
-        dest_row.addWidget(QLabel("取回到："))
+        dest_row.setSpacing(8)
+        dest_row.addWidget(label("取回到"))
         dest_row.addWidget(self.dest_edit, 1)
         dest_row.addWidget(self.browse_button)
-        note = QLabel("文件会保存在“目标文件夹\\所有者\\原路径”下，同名文件会被覆盖。")
-        note.setProperty("hint", "true")
+        note = label("文件会保存在“目标文件夹\\名称\\原路径”下，同名文件会被覆盖。", "hint")
 
         self.start_button = QPushButton("开始取回")
-        self.start_button.setProperty("primary", "true")
+        set_prop(self.start_button, "primary", True)
         self.start_button.clicked.connect(self._start)
         self.stop_button = QPushButton("停止")
-        self.stop_button.setProperty("danger", "true")
+        set_prop(self.stop_button, "danger", True)
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self._stop)
         self.close_button = QPushButton("关闭")
         self.close_button.clicked.connect(self.close)
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
         buttons.addWidget(self.start_button)
         buttons.addWidget(self.stop_button)
         buttons.addStretch(1)
@@ -91,27 +89,24 @@ class RestoreDialog(QDialog):
         self.bar.setRange(0, PROGRESS_STEPS)
         self.bar.setValue(0)
         self.bar.setTextVisible(False)
-        self.amount_label = QLabel("")
-        self.tape_now_label = QLabel("")
-        self.file_label = QLabel("")
-        self.file_label.setProperty("hint", "true")
+        self.amount_label = label("", "number")
+        self.tape_now_label = label("", "hint")
+        self.file_label = label("", "hint")
         self.file_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.result_label = QLabel("")
-        font = self.result_label.font()
-        font.setBold(True)
-        self.result_label.setFont(font)
+        self.result_label = label("")
         self.result_label.setWordWrap(True)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
 
         layout = QVBoxLayout(self)
+        page_margins(layout)
         layout.addWidget(summary)
         layout.addWidget(tape_label)
-        layout.addSpacing(6)
+        layout.addSpacing(4)
         layout.addLayout(dest_row)
         layout.addWidget(note)
         layout.addLayout(buttons)
-        layout.addSpacing(6)
+        layout.addSpacing(4)
         layout.addWidget(self.bar)
         layout.addWidget(self.amount_label)
         layout.addWidget(self.tape_now_label)
@@ -233,6 +228,7 @@ class RestoreDialog(QDialog):
         else:
             text = f"出错了：{message}"
         self.result_label.setText(text)
+        set_prop(self.result_label, "status", {"done": "ok", "stopped": "warn"}.get(result, "fail"))
         if result == "error":
             QMessageBox.warning(self, self.windowTitle(), text)
 

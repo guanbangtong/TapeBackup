@@ -30,6 +30,9 @@ class Config:
     threads: int = 14                     # parallel NAS -> staging copies
     raw_extensions: list[str] = field(default_factory=lambda: [".raw"])  # copied as-is; the rest is tarred
     db_backup_dir: str = ""               # NAS folder that receives a copy of the database ("" = off)
+    delete_source_default: bool = False   # new queue entries start with "delete the NAS source after backup" ticked
+    delete_delay_minutes: float = 6.0     # wait after the last tape write before deleting (LTFS writes its index periodically)
+    nas_recycle_dir: str = "#recycle"     # recycle folder in the NAS share root, emptied for the deleted folder ("" = leave it)
 
     def __post_init__(self) -> None:
         # "D:/x" -> "D:\x", "D:" -> "D:\" (a bare "D:" would mean "the current folder on D")
