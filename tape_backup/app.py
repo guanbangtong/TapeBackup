@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QPushButto
 
 from . import db
 from .config import Config
+from .icon import app_icon
 from .ui_backup import BackupPage
 from .ui_records import RecordsPage
 from .ui_search import SearchPage
@@ -96,7 +97,13 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    if sys.platform == "win32":
+        # Own taskbar identity, so Windows shows this app's icon instead of python's when run from source.
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TapeBackup")
     app = QApplication(sys.argv)
+    app.setWindowIcon(app_icon())
     app.setStyle("Fusion")
     app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setStyleSheet(STYLE)

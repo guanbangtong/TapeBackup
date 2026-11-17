@@ -10,10 +10,17 @@ if (-not (Test-Path -LiteralPath $Python)) {
     & $Python -m pip install --quiet -r requirements.txt
 }
 
+# The exe icon is drawn by the same code as the window icon (tape_backup\icon.py).
+New-Item -ItemType Directory -Force -Path build | Out-Null
+$Icon = Join-Path $PSScriptRoot "build\TapeBackup.ico"
+& $Python -m tape_backup.icon $Icon
+if ($LASTEXITCODE -ne 0) { throw "Icon generation failed with exit code $LASTEXITCODE" }
+
 & $Python -m PyInstaller `
     --noconfirm --clean `
     --onefile --windowed `
     --name TapeBackup `
+    --icon $Icon `
     run.py
 
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
