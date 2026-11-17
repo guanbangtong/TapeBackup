@@ -442,8 +442,8 @@ class Engine:
     def _scan(self, job: sqlite3.Row) -> None:
         """List the source folder and queue every file that is not on tape yet.
 
-        A file counts as already on tape when an archived record of this owner has the same
-        relative path, size and modification time.
+        A file counts as already on tape when an archived record from a backup of this same folder
+        has the same relative path, size and modification time.
         """
         con = self.con
         source = job["source_path"]
@@ -456,11 +456,13 @@ class Engine:
 
         archived: dict[tuple[str, int], list[float | None]] = {}
         for row in con.execute(
-            "SELECT f.rel_path, f.size, f.mtime FROM files f JOIN jobs j ON j.id=f.job_id "
+            "SELECT f.rel_path, f.size, f.mtime, j.source_path FROM files f JOIN jobs j ON j.id=f.job_id "
             "WHERE j.owner=? COLLATE NOCASE AND f.status='ARCHIVED'",
             (job["owner"],),
         ):
-            archived.setdefault((row["rel_path"].lower(), row["size"]), []).append(row["mtime"])
+            # Only backups of this very folder count: a folder elsewhere with the same name is other data.
+            if source_cleanup.same_source(row["source_path"], source):
+                archived.setdefault((row["rel_path"].lower(), row["size"]), []).append(row["mtime"])
 
         def on_tape(rel: str, size: int, mtime: float) -> bool:
             return any(
@@ -1023,10 +1025,15 @@ class Engine:
         p = self.progress
         p.job_id, p.owner = job_id, owner
         if not os.path.isdir(long_path(source)):
+            parent = os.path.dirname(os.path.normpath(source))
+            if parent and parent != source and not os.path.isdir(long_path(parent)):
+                # The NAS itself is not reachable; that is not the same as "the folder is gone".
+                raise JobError(f"无法访问 {parent}，NAS 可能暂时断开。源数据还没有删除，连上后重新点击开始即可。")
             self.log(f"{owner}：源文件夹 {source} 已经不存在，无需删除。")
             self._record_deletion(job_id, 0, 0, 0)
             return
-        self._check_job(job)  # never delete inside the staging folder, the tape or the records folder
+        self._check_job(job)
+        self._check_delete_paths(source)
 
         # 1. Wait until the tape has had time to write its index.
         last = con.execute(
@@ -1072,18 +1079,26 @@ class Engine:
             p.step()
 
         self.log(f"{owner}：删除 NAS 上已备份的 {len(candidates)} 个文件 ...")
-        deleted, deleted_bytes, not_deleted = source_cleanup.delete_files(
-            source, candidates, self._stop.is_set, on_file
-        )
+        try:
+            deleted, deleted_bytes, not_deleted = source_cleanup.delete_files(
+                source, candidates, self._stop.is_set, on_file
+            )
+        except BaseException as error:
+            # Keep count of what is already gone, so the totals are right after the run resumes.
+            partial = getattr(error, "partial_deletion", None)
+            if partial and partial[0]:
+                with self.con:
+                    self.con.execute(
+                        "UPDATE jobs SET deleted_files=deleted_files+?, deleted_bytes=deleted_bytes+? WHERE id=?",
+                        (partial[0], partial[1], job_id),
+                    )
+            raise
         kept += not_deleted
-        recycle = source_cleanup.recycle_path(source, self.cfg.nas_recycle_dir)
-        if recycle and os.path.isdir(long_path(recycle)):
-            p.current_file = recycle
-            files, size, errors = source_cleanup.purge_tree(recycle, self._stop.is_set)
-            text = f"{owner}：已清空 NAS 回收站 {recycle}（{files} 个文件，{format_bytes(size)}）"
-            self.log(text + (f"；{errors} 项无法删除" if errors else ""))
+        self._purge_recycle(owner, source)
 
         self._record_deletion(job_id, deleted, deleted_bytes, len(kept))
+        row = con.execute("SELECT deleted_files, deleted_bytes FROM jobs WHERE id=?", (job_id,)).fetchone()
+        deleted, deleted_bytes = row["deleted_files"], row["deleted_bytes"]
         text = f"{owner}：已删除 NAS 源数据 {deleted} 个文件，{format_bytes(deleted_bytes)}"
         if kept:
             text += f"；{len(kept)} 个文件不在磁带上或已改动，保留在 {source}"
@@ -1125,10 +1140,46 @@ class Engine:
             self.log(f"{owner}：这些文件所在的磁带不在磁带机里，按备份记录处理。")
         return problems
 
+    def _check_delete_paths(self, source: str) -> None:
+        """Stricter than _check_job: deleting is refused anywhere near this program's own folders."""
+        if source_cleanup.is_link(source):
+            raise JobError(f"源文件夹 {source} 是一个指向别处的链接，为安全起见不删除。")
+        real = _real(source)
+        for label, other in (
+            ("中转目录", self.cfg.staging_root),
+            ("磁带", self.cfg.tape_root),
+            ("记录存放目录", self.cfg.data_dir),
+        ):
+            if _overlaps(real, _real(other)):
+                raise JobError(f"源文件夹 {source} 与{label}（{other}）重叠，不能删除。请把它从队列移除。")
+
+    def _purge_recycle(self, owner: str, source: str) -> None:
+        """Empty the NAS recycle folder that belongs to this source, if it is safe to do so."""
+        recycle = source_cleanup.recycle_path(source, self.cfg.nas_recycle_dir)
+        if not recycle or not os.path.isdir(long_path(recycle)):
+            return
+        real = _real(recycle)
+        for label, other in (
+            ("源文件夹", source), ("中转目录", self.cfg.staging_root),
+            ("磁带", self.cfg.tape_root), ("记录存放目录", self.cfg.data_dir),
+        ):
+            if _overlaps(real, _real(other)):
+                self.log(f"警告：回收站位置 {recycle} 与{label}重叠，没有清空回收站。请检查设置里的“NAS 回收站文件夹名”。")
+                return
+        if source_cleanup.is_link(recycle):
+            self.log(f"警告：回收站位置 {recycle} 是一个链接，没有清空回收站。")
+            return
+        self.progress.current_file = recycle
+        files, size, errors = source_cleanup.purge_tree(recycle, self._stop.is_set)
+        text = f"{owner}：已清空 NAS 回收站 {recycle}（{files} 个文件，{format_bytes(size)}）"
+        self.log(text + (f"；{errors} 项无法删除" if errors else ""))
+
     def _record_deletion(self, job_id: int, files: int, size: int, kept: int) -> None:
+        """Mark the deletion done. files/size are added to what an interrupted earlier attempt counted."""
         with self.con:
             self.con.execute(
-                "UPDATE jobs SET source_deleted_at=?, deleted_files=?, deleted_bytes=?, kept_files=? WHERE id=?",
+                "UPDATE jobs SET source_deleted_at=?, deleted_files=deleted_files+?, "
+                "deleted_bytes=deleted_bytes+?, kept_files=? WHERE id=?",
                 (db.now(), files, size, kept, job_id),
             )
         self._notify(job_id)

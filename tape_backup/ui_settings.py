@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import Config
+from .source_cleanup import valid_folder_name
 from .ui_style import card, label, page_margins, set_prop
 
 COLUMN_WIDTH = 760   # the form never gets wider than this
@@ -266,6 +267,11 @@ class SettingsPage(QWidget):
         extensions = parse_extensions(self.extensions.text())
         if not extensions:
             self._warn("“直接拷贝的扩展名”至少要填一个，例如 .raw。", self.extensions)
+            return
+        recycle = self.recycle.text().strip()
+        if recycle and not valid_folder_name(recycle.strip("\\/").strip()):
+            self._warn("“NAS 回收站文件夹名”只能填一个文件夹名，例如 #recycle，不能含 \\ / : 或 . ..。"
+                       "留空表示不处理回收站。", self.recycle)
             return
 
         cfg = self.cfg

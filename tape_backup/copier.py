@@ -323,14 +323,43 @@ def remove_quietly(path: str) -> None:
 
 
 def prune_empty_dirs(root: str) -> None:
-    """Delete empty directories under root, and root itself if it ends up empty."""
-    if not os.path.isdir(long_path(root)):
-        return
-    for dirpath, _dirs, _files in os.walk(long_path(root), topdown=False):
+    """Delete empty directories under root, and root itself if it ends up empty.
+
+    Links (symbolic links, junctions) are neither followed nor removed, so a folder that holds one
+    is never empty and whatever the link points to is never touched.
+    """
+
+    def prune(folder: str) -> bool:
+        """Remove folder if everything in it could be removed. True if it is gone."""
         try:
-            os.rmdir(dirpath)  # only succeeds when empty
+            with os.scandir(folder) as it:
+                entries = list(it)
         except OSError:
-            pass
+            return False
+        empty = True
+        for entry in entries:
+            try:
+                if entry.is_symlink() or entry.is_junction() or not entry.is_dir(follow_symlinks=False):
+                    empty = False
+                elif not prune(entry.path):
+                    empty = False
+            except OSError:
+                empty = False
+        if not empty:
+            return False
+        try:
+            os.rmdir(folder)
+        except OSError:
+            return False
+        return True
+
+    top = long_path(root)
+    try:
+        if not os.path.isdir(top) or os.path.islink(top) or os.path.isjunction(top):
+            return
+    except OSError:
+        return
+    prune(top)
 
 
 def format_bytes(n: float) -> str:

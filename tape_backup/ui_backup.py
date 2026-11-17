@@ -497,6 +497,7 @@ class BackupPage(QWidget):
             if not ok or not name:
                 return
         con = db.connect(self.cfg.db_path)
+        moved = False
         try:
             while True:
                 if not valid_owner_name(name):
@@ -522,6 +523,7 @@ class BackupPage(QWidget):
                 box.addButton("取消", QMessageBox.RejectRole)
                 box.exec()
                 if box.clickedButton() is same:
+                    moved = True
                     break
                 if box.clickedButton() is not rename:
                     return
@@ -529,7 +531,14 @@ class BackupPage(QWidget):
                 name = name.strip()
                 if not ok or not name:
                     return
-            if history["archived_files"] > 0:
+            if moved:
+                # Backup records only count for the folder they were made of, so a moved folder starts over.
+                QMessageBox.information(
+                    self, TITLE,
+                    f"位置变了，无法确认新位置的文件和以前备份的完全一样，所以这次会把 {folder} 里的所有文件"
+                    "重新备份一遍。\n磁带上以前的同名文件会保留在记录里，可以照常查询和取回。",
+                )
+            elif history["archived_files"] > 0:
                 QMessageBox.information(
                     self, TITLE,
                     f"“{name}”以前备份过（已有 {history['archived_files']} 个文件在磁带上）。\n"
