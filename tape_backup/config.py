@@ -62,7 +62,7 @@ class Config:
     def load(cls, path: str | None = None) -> "Config":
         path = path or default_config_path()
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:  # tolerate the BOM that Notepad and PowerShell add
                 data = json.load(f)
         except (OSError, ValueError):
             return cls()
