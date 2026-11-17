@@ -1,0 +1,13 @@
+# 虚拟环境和 Python 缓存
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# PyInstaller 打包产物
+build/
+dist/
+*.spec
+
+# 本机设置（每台电脑不同）
+config.json
