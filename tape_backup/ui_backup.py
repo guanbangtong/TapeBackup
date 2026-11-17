@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
 from . import db
 from .config import Config
 from .copier import format_bytes
-from .engine import Engine, normalize_tape_id, read_tape_marker
+from .engine import Engine, normalize_tape_id, read_tape_marker, valid_owner_name
 
 TITLE = "磁带备份"
 BAR_RANGE = 1000
@@ -351,10 +351,37 @@ class BackupPage(QWidget):
                 return
         con = db.connect(self.cfg.db_path)
         try:
-            history = db.owner_history(con, name)
-            if history["active"]:
-                QMessageBox.warning(self, TITLE, f"“{name}”已在队列中，不能重复添加。")
-                return
+            while True:
+                if not valid_owner_name(name):
+                    QMessageBox.warning(self, TITLE, f"“{name}”不能用作名称（不能含 \\ / : * ? \" < > | ，不能以点或空格结尾）。")
+                    return
+                history = db.owner_history(con, name)
+                if history["active"]:
+                    QMessageBox.warning(self, TITLE, f"“{name}”已在队列中，不能重复添加。")
+                    return
+                # Same name, different folder: mixing two data sets under one name would skip or overwrite files.
+                known = {os.path.normcase(os.path.normpath(s)) for s in history["sources"]}
+                if not known or os.path.normcase(folder) in known:
+                    break
+                box = QMessageBox(self)
+                box.setWindowTitle(TITLE)
+                box.setIcon(QMessageBox.Warning)
+                box.setText(
+                    f"名称“{name}”以前备份的是另一个位置：\n{history['sources'][0]}\n\n"
+                    f"现在选的是：\n{folder}\n\n这两个是同一份数据吗？"
+                )
+                same = box.addButton("是同一份数据（只是位置变了）", QMessageBox.AcceptRole)
+                rename = box.addButton("不是，换一个名称", QMessageBox.ActionRole)
+                box.addButton("取消", QMessageBox.RejectRole)
+                box.exec()
+                if box.clickedButton() is same:
+                    break
+                if box.clickedButton() is not rename:
+                    return
+                name, ok = QInputDialog.getText(self, TITLE, "请输入一个新的名称（例如加上姓名或日期）：", text=name)
+                name = name.strip()
+                if not ok or not name:
+                    return
             if history["archived_files"] > 0:
                 QMessageBox.information(
                     self, TITLE,

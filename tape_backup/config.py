@@ -31,6 +31,14 @@ class Config:
     raw_extensions: list[str] = field(default_factory=lambda: [".raw"])  # copied as-is; the rest is tarred
     db_backup_dir: str = ""               # NAS folder that receives a copy of the database ("" = off)
 
+    def __post_init__(self) -> None:
+        # "D:/x" -> "D:\x", "D:" -> "D:\" (a bare "D:" would mean "the current folder on D")
+        for name in ("staging_root", "tape_root", "data_dir"):
+            path = os.path.normpath(getattr(self, name))
+            if len(path) == 2 and path[1] == ":":
+                path += os.sep
+            setattr(self, name, path)
+
     @property
     def db_path(self) -> str:
         return os.path.join(self.data_dir, "tape_archive.db")

@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS batches (
     cleaned     INTEGER NOT NULL DEFAULT 0,  -- staging copies deleted after archiving
     tar_name    TEXT,                        -- tar holding this batch's non-raw files, if any
     tar_size    INTEGER,
-    tar_sha256  TEXT,
+    tar_sha256  TEXT,                        -- of the whole tar, taken while it was built
+    tar_written TEXT,                        -- tape id the tar was completely written to (before ARCHIVED)
     bytes       INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL,
     archived_at TEXT
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS files (
     sha256    TEXT,
     status    TEXT NOT NULL DEFAULT 'PENDING',
     attempts  INTEGER NOT NULL DEFAULT 0,
+    written   TEXT,                          -- tape id a raw file was completely written to (before ARCHIVED)
     tape_id   TEXT,
     tar_name  TEXT,
     error     TEXT
@@ -122,7 +124,17 @@ def owner_history(con: sqlite3.Connection, owner: str) -> dict:
 
     archived_files > 0  -> the new job will be incremental
     legacy_only         -> only old CSV records exist (no file list), so the new job is a full backup
+    sources             -> folders that were backed up under this name before; a different folder with
+                           the same name must not be mixed in unless it really is the same data
     """
+    sources = [
+        r[0]
+        for r in con.execute(
+            "SELECT DISTINCT source_path FROM jobs WHERE owner=? COLLATE NOCASE AND legacy=0 "
+            "AND status IN ('DONE','CANCELLED')",
+            (owner,),
+        )
+    ]
     row = con.execute(
         "SELECT COUNT(*) AS n, MAX(j.source_path) AS src FROM files f JOIN jobs j ON j.id=f.job_id "
         "WHERE j.owner=? COLLATE NOCASE AND f.status='ARCHIVED'",
@@ -140,6 +152,7 @@ def owner_history(con: sqlite3.Connection, owner: str) -> dict:
         "last_source": row["src"],
         "legacy_only": legacy > 0 and row["n"] == 0,
         "active": active > 0,
+        "sources": sources,
     }
 
 
@@ -238,7 +251,7 @@ def import_legacy_csv(con: sqlite3.Connection, csv_path: str) -> tuple[int, int]
     with open(csv_path, encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             date = (row.get("date") or "").strip()
-            tape = (row.get("tape_id") or "").strip()
+            tape = (row.get("tape_id") or "").strip().upper()  # tape ids are upper case everywhere
             owner = (row.get("owner") or "").strip()
             if not owner or not tape:
                 continue

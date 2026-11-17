@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
+from PySide6.QtCore import QLockFile
 from PySide6.QtGui import QCloseEvent, QFont
 from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QPushButton, QTabWidget
 
@@ -110,6 +112,13 @@ def main() -> int:
             )
             if not SettingsDialog(cfg).exec():
                 return 1
+
+    # Two copies working on the same records and staging folder would corrupt each other's work.
+    lock = QLockFile(os.path.join(cfg.data_dir, "tapebackup.lock"))
+    lock.setStaleLockTime(0)  # the lock is only released when this process ends (or has died)
+    if not lock.tryLock(100):
+        QMessageBox.warning(None, APP_TITLE, "磁带备份软件已经在运行（可能在另一个窗口或另一个用户下）。\n同一时间只能打开一个。")
+        return 1
 
     window = MainWindow(cfg)
     window.show()

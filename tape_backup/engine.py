@@ -7,18 +7,25 @@ No UI code here. A front end drives it like this:
     engine.stop()                              # from any thread; run() returns ("stopped", "")
     engine.progress.snapshot()                 # from any thread; poll it with a timer
 
+Create a new Engine for every run: one that was stopped stays stopped.
+
 Callbacks (all called from the thread that runs run()):
     on_log(text)                       one human-readable line
-    ask_tape(reason, suggested) -> id  a tape must be inserted/changed; block until the user answers,
-                                       return the tape id they confirmed, or None to stop
+    ask_tape(reason, suggested) -> id  a tape must be inserted/changed/confirmed; block until the user
+                                       answers, return the tape id they confirmed, or None to stop
     on_job_update(job_id)              a job's row changed (status, counters)
 
 Every step is recorded in the database before the next one starts, so an interrupted
 run (stop button, crash, power loss) continues where it left off the next time run() is called.
 
-The one rule that protects data: staging copies are deleted only in _cleanup, and _cleanup
-only runs for a batch whose row says ARCHIVED, which is written only after every file of the
-batch was found on tape with the right size.
+Rules that protect data:
+  * Staging copies are deleted only in _cleanup, and _cleanup only runs for a batch whose row says
+    ARCHIVED, which is written only after every file of the batch was found on tape with the right size.
+  * A file gets its real name (on the staging disk and on tape) only when it is complete and its
+    SHA-256 is right; until then it is "<name>.part". So an archived file on tape is only ever
+    replaced by a complete, verified newer version.
+  * What is "already on tape" after an interruption is decided by what this program recorded as
+    completely written (files.written / batches.tar_written), never by a same-sized file alone.
 """
 
 from __future__ import annotations
@@ -38,13 +45,13 @@ from typing import Callable
 from . import db
 from .config import Config
 from .copier import (
+    PART_SUFFIX,
     TAPE_CHUNK,
     CopyError,
     Stopped,
     TarWriter,
     copy_file,
     format_bytes,
-    hash_file,
     list_tar,
     long_path,
     prune_empty_dirs,
@@ -52,17 +59,25 @@ from .copier import (
     with_retry,
 )
 
-# Space a file needs inside a tar beyond its own size: header, PAX record for long or
-# non-ASCII names, and padding to a 512-byte boundary.
-TAR_MEMBER_OVERHEAD = 2048
-TAR_END_OVERHEAD = tarfile.RECORDSIZE
+TAR_END_OVERHEAD = 2 * tarfile.RECORDSIZE  # end-of-archive blocks plus padding to a full record
 MAX_ATTEMPTS = 3
+MTIME_TOLERANCE = 2.0  # seconds; file systems round modification times differently
 
 PHASES = ("scan", "stage", "tape", "verify", "cleanup")
 
+EJECT_REMINDER = "取出磁带前，请先在 LTFS 软件里正常弹出磁带，确保内容已完整写入。"
+
 
 class EngineError(Exception):
-    """The run cannot continue (tape, staging disk or NAS problem). The message is shown to the user."""
+    """The run cannot continue (tape or staging disk problem). The message is shown to the user."""
+
+
+class JobError(Exception):
+    """This job cannot run now (its source is missing or unusable). Other jobs in the queue still can."""
+
+
+class _StagingWriteError(EngineError):
+    """Writing to the staging disk failed, most likely because it is full."""
 
 
 # ---------------------------------------------------------------- on-media layout
@@ -83,6 +98,25 @@ def tar_media_path(root: str, owner: str, tar_name: str) -> str:
 def tar_member_name(owner: str, rel_path: str) -> str:
     """Name of a non-raw file inside its batch tar: <owner>/<rel_path with forward slashes>."""
     return f"{owner}/{rel_path.replace(os.sep, '/')}"
+
+
+def tar_member_cost(owner: str, rel_path: str, size: int) -> int:
+    """Upper bound of the space a file takes inside a tar: data, header, padding, PAX record for the name."""
+    name_bytes = len(tar_member_name(owner, rel_path).encode("utf-8"))
+    return size + 2048 + 512 * (name_bytes // 512 + 1)
+
+
+_BAD_NAME_CHARS = set('\\/:*?"<>|')
+
+
+def valid_owner_name(name: str) -> bool:
+    """An owner name becomes a folder name on the staging disk and on tape, so it must be a plain one."""
+    return bool(
+        name
+        and name == name.strip()
+        and not name.endswith(".")
+        and not any(c in _BAD_NAME_CHARS or ord(c) < 32 for c in name)
+    )
 
 
 # ---------------------------------------------------------------- tape identity
@@ -187,6 +221,7 @@ class Engine:
         ask_tape: Callable[[str, str | None], str | None] | None = None,
         on_job_update: Callable[[int], None] | None = None,
         disk_free: Callable[[str], int] | None = None,
+        disk_total: Callable[[str], int] | None = None,
         retry_delay: float = 2.0,
     ) -> None:
         self.cfg = cfg
@@ -196,19 +231,20 @@ class Engine:
         self._ask_tape = ask_tape
         self._on_job_update = on_job_update
         self._free = disk_free or (lambda path: shutil.disk_usage(path).free)
+        self._total = disk_total or (lambda path: shutil.disk_usage(path).total)
         self._retry_delay = retry_delay
         self._stop = threading.Event()
+        self._confirmed_unmarked = ""  # tape id the user confirmed for a tape that carries no marker
         self.con: sqlite3.Connection = None  # type: ignore[assignment]  # opened in run()
 
     # ------------------------------------------------------------ public
 
     def stop(self) -> None:
-        """Ask the running engine to stop. The file in flight is abandoned and redone next time."""
+        """Ask the engine to stop. The file in flight is abandoned and redone next time."""
         self._stop.set()
 
     def run(self, tape_id: str) -> tuple[str, str]:
         """Process every unfinished and queued job. Returns ('done'|'stopped'|'error', message)."""
-        self._stop.clear()
         self.tape_id = normalize_tape_id(tape_id)
         self.progress.tape_id = self.tape_id
         try:
@@ -221,12 +257,23 @@ class Engine:
             if not jobs:
                 return "done", "队列里没有需要备份的任务。"
             failed = 0
+            skipped: list[str] = []
             for job in jobs:
-                failed += self._run_job(job)
+                try:
+                    failed += self._run_job(job)
+                except JobError as e:  # this job cannot run; the others still can
+                    self.log(f"任务 {job['owner']} 未完成：{e}")
+                    skipped.append(f"{job['owner']}：{e}")
+            if skipped:
+                done = len(jobs) - len(skipped)
+                return "error", (
+                    f"{len(skipped)} 个任务未完成（其余 {done} 个已完成）。问题解决后重新点击开始即可继续：\n\n"
+                    + "\n".join(skipped)
+                )
             message = f"全部完成，共 {len(jobs)} 个任务。"
             if failed:
-                message += f"有 {failed} 个文件未能备份，详见记录页。"
-            return "done", message
+                message += f"\n有 {failed} 个文件未能备份，可在“记录”页查看。"
+            return "done", f"{message}\n\n{EJECT_REMINDER}"
         except Stopped:
             self.log("已停止。下次点击开始会从中断处继续。")
             return "stopped", ""
@@ -257,7 +304,7 @@ class Engine:
                 for row in con.execute(
                     "SELECT rel_path FROM files WHERE batch_id=? AND kind='raw'", (batch["id"],)
                 ):
-                    remove_quietly(raw_media_path(self.cfg.staging_root, job["owner"], row["rel_path"]))
+                    self._remove_staged_raw(job["owner"], row["rel_path"])
                 if batch["tar_name"]:
                     remove_quietly(os.path.join(stage_root, batch["tar_name"]))
             prune_empty_dirs(stage_root)
@@ -298,6 +345,7 @@ class Engine:
         p.batch_seq = p.batch_estimate = 0
         p.job_done = p.job_total = 0
         self.log(f"开始任务：{job['owner']}（{job['source_path']}）")
+        self._check_job(job)
 
         con.execute(
             "UPDATE jobs SET status='RUNNING', started_at=COALESCE(started_at, ?) WHERE id=?", (db.now(), job_id)
@@ -336,12 +384,31 @@ class Engine:
 
         return self._finish(job)
 
+    def _check_job(self, job: sqlite3.Row) -> None:
+        """Refuse a job whose name or source folder would make the program work on its own files."""
+        owner, source = job["owner"], job["source_path"]
+        if not valid_owner_name(owner):
+            raise JobError(f"名称“{owner}”不能用作文件夹名。请把它从队列移除，换一个名称重新添加。")
+        if not os.path.isdir(long_path(source)):
+            raise JobError(f"源文件夹不存在或无法访问：{source}")
+        real = _real(source)
+        own_staging = os.path.join(self.cfg.staging_root, archive_dir_name(owner))
+        for label, other in (
+            ("这个名称在中转盘上的暂存文件夹", own_staging),
+            ("磁带", self.cfg.tape_root),
+            ("记录存放目录", self.cfg.data_dir),
+        ):
+            if _overlaps(real, _real(other)):
+                raise JobError(f"源文件夹 {source} 与{label}（{other}）重叠，不能备份。请把它从队列移除。")
+
     def _finish(self, job: sqlite3.Row) -> int:
         con = self.con
         job_id = job["id"]
         with con:
             self._update_counters(con, job_id)
             con.execute("UPDATE jobs SET status='DONE', finished_at=? WHERE id=?", (db.now(), job_id))
+        prune_empty_dirs(os.path.join(self.cfg.staging_root, archive_dir_name(job["owner"])))
+        self._begin_phase(job_id, "cleanup", done=0, total=0, unit="files")  # re-base: the job bar ends at 100%
         row = con.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         tapes = con.execute(
             "SELECT GROUP_CONCAT(DISTINCT tape_id) FROM batches WHERE job_id=? AND status='ARCHIVED'", (job_id,)
@@ -365,7 +432,11 @@ class Engine:
     # ------------------------------------------------------------ scan
 
     def _scan(self, job: sqlite3.Row) -> None:
-        """List the source folder and queue every file that is not on tape yet (same path and size)."""
+        """List the source folder and queue every file that is not on tape yet.
+
+        A file counts as already on tape when an archived record of this owner has the same
+        relative path, size and modification time.
+        """
         con = self.con
         source = job["source_path"]
         p = self.progress
@@ -375,17 +446,22 @@ class Engine:
         p.current_file = ""
         self.log(f"扫描 {source} ...")
 
-        archived = {
-            (row["rel_path"].lower(), row["size"])
-            for row in con.execute(
-                "SELECT f.rel_path, f.size FROM files f JOIN jobs j ON j.id=f.job_id "
-                "WHERE j.owner=? COLLATE NOCASE AND f.status='ARCHIVED'",
-                (job["owner"],),
+        archived: dict[tuple[str, int], list[float | None]] = {}
+        for row in con.execute(
+            "SELECT f.rel_path, f.size, f.mtime FROM files f JOIN jobs j ON j.id=f.job_id "
+            "WHERE j.owner=? COLLATE NOCASE AND f.status='ARCHIVED'",
+            (job["owner"],),
+        ):
+            archived.setdefault((row["rel_path"].lower(), row["size"]), []).append(row["mtime"])
+
+        def on_tape(rel: str, size: int, mtime: float) -> bool:
+            return any(
+                m is None or abs(m - mtime) <= MTIME_TOLERANCE for m in archived.get((rel.lower(), size), ())
             )
-        }
 
         found: list[tuple[str, int, float, str]] = []
-        skipped = unreadable = 0
+        unreadable: list[tuple[str, str]] = []  # (path, reason): recorded as FAILED so they are not overlooked
+        skipped = 0
         stack = [""]
         while stack:
             self._check_stop()
@@ -395,9 +471,9 @@ class Engine:
                 entries = os.scandir(long_path(abs_dir))
             except OSError as e:
                 if not rel_dir:
-                    raise EngineError(f"无法读取源文件夹 {source}：{e}") from e
-                unreadable += 1
-                self.log(f"警告：无法读取子文件夹，已跳过：{rel_dir}（{e}）")
+                    raise JobError(f"无法读取源文件夹 {source}：{e}") from e
+                unreadable.append((rel_dir + os.sep, f"扫描时无法读取这个文件夹：{e}"))
+                self.log(f"警告：无法读取子文件夹，其中的文件未备份：{rel_dir}（{e}）")
                 continue
             with entries:
                 for entry in entries:
@@ -410,10 +486,10 @@ class Engine:
                             continue
                         st = entry.stat(follow_symlinks=False)
                     except OSError as e:
-                        unreadable += 1
-                        self.log(f"警告：无法读取，已跳过：{rel}（{e}）")
+                        unreadable.append((rel, f"扫描时无法读取：{e}"))
+                        self.log(f"警告：无法读取，未备份：{rel}（{e}）")
                         continue
-                    if (rel.lower(), st.st_size) in archived:
+                    if on_tape(rel, st.st_size, st.st_mtime):
                         skipped += 1
                         continue
                     kind = "raw" if self.cfg.is_raw(entry.name) else "nonraw"
@@ -429,6 +505,10 @@ class Engine:
                 "INSERT INTO files(job_id, rel_path, size, mtime, kind) VALUES (?,?,?,?,?)",
                 [(job["id"], rel, size, mtime, kind) for rel, size, mtime, kind in found],
             )
+            con.executemany(
+                "INSERT INTO files(job_id, rel_path, size, kind, status, error) VALUES (?,?,0,'nonraw','FAILED',?)",
+                [(job["id"], rel, reason) for rel, reason in unreadable],
+            )
             con.execute(
                 "UPDATE jobs SET scanned=1, total_files=?, total_bytes=? WHERE id=?",
                 (len(found), total_bytes, job["id"]),
@@ -437,7 +517,7 @@ class Engine:
         if skipped:
             text += f"；{skipped} 个文件已在磁带上，跳过"
         if unreadable:
-            text += f"；{unreadable} 项无法读取"
+            text += f"；{len(unreadable)} 项无法读取"
         self.log(text)
         self._notify(job["id"])
 
@@ -446,10 +526,11 @@ class Engine:
     def _plan_batch(self, job: sqlite3.Row) -> sqlite3.Row | None:
         """Pick the pending files for the next batch: as many as fit on the staging disk and on the tape."""
         con = self.con
-        job_id = job["id"]
+        job_id, owner = job["id"], job["owner"]
         while True:
             pending = con.execute(
-                "SELECT id, size, kind FROM files WHERE job_id=? AND status='PENDING' AND batch_id IS NULL "
+                "SELECT id, size, kind, rel_path FROM files "
+                "WHERE job_id=? AND status='PENDING' AND batch_id IS NULL "
                 "ORDER BY (kind='raw'), id",  # non-raw first so the tar goes out with the first batch
                 (job_id,),
             ).fetchall()
@@ -460,16 +541,19 @@ class Engine:
             stage_cap = self._free(self.cfg.staging_root) - self.cfg.reserve_staging_bytes
             tape_cap = self._free(self.cfg.tape_root) - self.cfg.reserve_tape_bytes
             remaining = min(stage_cap, tape_cap)
-            if any(row["kind"] == "nonraw" for row in pending):
-                remaining -= TAR_END_OVERHEAD
 
             selected: list[int] = []
             has_tar = False
-            smallest = None
+            alone: list[tuple[sqlite3.Row, int]] = []  # what each file would need as the only one in a batch
             for row in pending:
-                cost = row["size"] + (TAR_MEMBER_OVERHEAD if row["kind"] == "nonraw" else 0)
-                if smallest is None or cost < smallest:
-                    smallest = cost
+                if row["kind"] == "nonraw":
+                    cost = tar_member_cost(owner, row["rel_path"], row["size"])
+                    alone.append((row, cost + TAR_END_OVERHEAD))
+                    if not has_tar:
+                        cost += TAR_END_OVERHEAD  # the first member opens the tar
+                else:
+                    cost = row["size"]
+                    alone.append((row, cost))
                 if cost <= remaining:
                     selected.append(row["id"])
                     remaining -= cost
@@ -477,23 +561,29 @@ class Engine:
             if selected:
                 break
 
-            assert smallest is not None
-            if smallest + TAR_END_OVERHEAD <= stage_cap:
-                # The staging disk has room but the tape does not: change tape, then plan again.
-                self._ensure_tape(smallest + TAR_END_OVERHEAD)
+            # Nothing fits right now. Files that can never fit are failed; anything else is a
+            # condition the user can fix (change tape, free the staging disk), so the run pauses.
+            stage_max = self._total(self.cfg.staging_root) - self.cfg.reserve_staging_bytes
+            tape_max = self._total(self.cfg.tape_root) - self.cfg.reserve_tape_bytes
+            hopeless = [(row, need) for row, need in alone if need > stage_max or need > tape_max]
+            if hopeless:
+                with con:
+                    for row, need in hopeless:
+                        where = "中转盘" if need > stage_max else "一盘磁带"
+                        con.execute(
+                            "UPDATE files SET status='FAILED', error=? WHERE id=?",
+                            (f"文件（{format_bytes(row['size'])}）比{where}的总容量还大，无法备份", row["id"]),
+                        )
+                self.log(f"警告：{len(hopeless)} 个文件比中转盘或磁带的容量还大，无法备份。")
                 continue
-            reason = (
-                f"文件大于中转盘可用空间（可用 {format_bytes(max(stage_cap, 0))}）。"
-                "请清理中转盘后把这个文件夹重新加入队列，只会备份剩下的文件。"
+            smallest = min(need for _row, need in alone)
+            if smallest <= stage_cap:
+                self._ensure_tape(smallest)  # the tape is what is full: this asks for another one
+                continue
+            raise EngineError(
+                f"中转盘 {self.cfg.staging_root} 空间不足：可用 {format_bytes(max(stage_cap, 0))}，"
+                f"而剩下最小的文件需要 {format_bytes(smallest)}。请清理中转盘后重新点击开始，会从中断处继续。"
             )
-            with con:
-                con.execute(
-                    "UPDATE files SET status='FAILED', error=? "
-                    "WHERE job_id=? AND status='PENDING' AND batch_id IS NULL",
-                    (reason, job_id),
-                )
-            self.log(f"警告：剩余 {len(pending)} 个文件无法暂存：{reason}")
-            return None
 
         seq = con.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM batches WHERE job_id=?", (job_id,)).fetchone()[0]
         with con:
@@ -505,7 +595,7 @@ class Engine:
             assert batch_id is not None
             if has_tar:
                 # Timestamp + batch id: never collides with a tar already on a tape.
-                tar_name = f"{job['owner']}_nonraw_{datetime.now():%Y%m%d_%H%M%S}_b{batch_id}.tar"
+                tar_name = f"{owner}_nonraw_{datetime.now():%Y%m%d_%H%M%S}_b{batch_id}.tar"
                 con.execute("UPDATE batches SET tar_name=? WHERE id=?", (tar_name, batch_id))
             con.executemany("UPDATE files SET batch_id=? WHERE id=?", [(batch_id, fid) for fid in selected])
         self.log(f"第 {seq} 批：{len(selected)} 个文件")
@@ -538,11 +628,13 @@ class Engine:
         nonraw = [r for r in rows if r["kind"] == "nonraw"]
         raw = [r for r in rows if r["kind"] == "raw"]
 
-        # What an interrupted earlier run left behind is reused only if it is provably complete.
+        # What an interrupted earlier run left behind is reused only if it was recorded as complete.
+        # (Its content is checked against the recorded SHA-256 when it is written to tape.)
         tar_ready = bool(
             nonraw
             and tar_path
             and batch["tar_size"] is not None
+            and batch["tar_sha256"]
             and all(r["status"] == "STAGED" for r in nonraw)
             and _size(tar_path) == batch["tar_size"]
         )
@@ -555,9 +647,12 @@ class Engine:
                 con.execute(
                     "UPDATE files SET status='PENDING', sha256=NULL WHERE batch_id=? AND kind='nonraw'", (batch_id,)
                 )
-                con.execute("UPDATE batches SET tar_size=NULL, tar_sha256=NULL WHERE id=?", (batch_id,))
+                con.execute(
+                    "UPDATE batches SET tar_size=NULL, tar_sha256=NULL, tar_written=NULL WHERE id=?", (batch_id,)
+                )
             con.executemany(
-                "UPDATE files SET status='PENDING', sha256=NULL WHERE id=?", [(r["id"],) for r in raw_todo]
+                "UPDATE files SET status='PENDING', sha256=NULL, written=NULL WHERE id=?",
+                [(r["id"],) for r in raw_todo],
             )
 
         todo_bytes = sum(r["size"] for r in raw_todo) + (0 if tar_ready else sum(r["size"] for r in nonraw))
@@ -565,15 +660,25 @@ class Engine:
         self._begin_phase(job["id"], "stage", done=total_bytes - todo_bytes, total=total_bytes)
         self.log(f"第 {batch['seq']} 批：暂存到中转盘，{format_bytes(todo_bytes)}")
 
-        if nonraw and not tar_ready:
-            assert tar_path is not None
-            self._build_tar(job, batch, nonraw, tar_path)
-        if raw_todo:
-            self._stage_raw(job, raw_todo)
+        try:
+            if nonraw and not tar_ready:
+                assert tar_path is not None
+                self._build_tar(job, batch, nonraw, tar_path)
+            if raw_todo:
+                self._stage_raw(job, raw_todo)
+        except _StagingWriteError as e:
+            # Usually the disk filled up because files grew after the scan. Give back what could not
+            # be staged (with fresh sizes, so the next plan is right) and carry on with what is here.
+            self._release_unstaged(job, batch_id)
+            if not con.execute(
+                "SELECT COUNT(*) FROM files WHERE batch_id=? AND status='STAGED'", (batch_id,)
+            ).fetchone()[0]:
+                raise EngineError(f"{e}。请清理中转盘 {self.cfg.staging_root} 后重新点击开始，会从中断处继续。") from e
+            self.log(f"警告：{e}。这一批先处理已经暂存好的文件，其余的留到下一批。")
 
         staged = con.execute(
-            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN kind='raw' THEN size END), 0) "
-            "FROM files WHERE batch_id=? AND status='STAGED'",
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN kind='raw' THEN size END), 0), "
+            "       COALESCE(SUM(kind='nonraw'), 0) FROM files WHERE batch_id=? AND status='STAGED'",
             (batch_id,),
         ).fetchone()
         if staged[0] == 0:
@@ -582,8 +687,12 @@ class Engine:
             prune_empty_dirs(stage_root)
             self.log(f"第 {batch['seq']} 批没有可备份的文件，已取消。")
             return False
-        tar_size = self._batch(batch_id)["tar_size"] or 0
         with con:
+            if not staged[2]:  # no tar in this batch after all
+                con.execute(
+                    "UPDATE batches SET tar_name=NULL, tar_size=NULL, tar_sha256=NULL WHERE id=?", (batch_id,)
+                )
+            tar_size = self._batch(batch_id)["tar_size"] or 0
             con.execute("UPDATE batches SET status='STAGED', bytes=? WHERE id=?", (staged[1] + tar_size, batch_id))
         return True
 
@@ -592,29 +701,30 @@ class Engine:
         owner, source = job["owner"], job["source_path"]
         remove_quietly(tar_path)
         done: list[tuple[int, str, int]] = []  # (size, sha256, file id)
-        with TarWriter(tar_path) as tar:
-            for row in nonraw:
-                self._check_stop()
-                self.progress.current_file = row["rel_path"]
-                src = os.path.join(source, row["rel_path"])
-                arcname = tar_member_name(owner, row["rel_path"])
-                try:
-                    size, sha = with_retry(
-                        lambda: tar.add(src, arcname, should_stop=self._stop.is_set, on_bytes=self.progress.add),
-                        delay=self._retry_delay,
-                        should_stop=self._stop.is_set,
-                    )
-                except CopyError as e:
-                    if e.side == "dst":
-                        raise EngineError(f"写入中转盘失败（空间不足？）：{e}") from e
-                    self._source_failure(job, row, e)
-                    continue
-                done.append((size, sha, row["id"]))
+        try:
+            with TarWriter(tar_path) as tar:
+                for row in nonraw:
+                    self._check_stop()
+                    self.progress.current_file = row["rel_path"]
+                    src = os.path.join(source, row["rel_path"])
+                    arcname = tar_member_name(owner, row["rel_path"])
+                    try:
+                        size, sha = with_retry(
+                            lambda: tar.add(src, arcname, should_stop=self._stop.is_set, on_bytes=self.progress.add),
+                            delay=self._retry_delay,
+                            should_stop=self._stop.is_set,
+                        )
+                    except CopyError as e:
+                        if e.side == "dst":
+                            raise
+                        self._source_failure(job, row, e)
+                        continue
+                    done.append((size, sha, row["id"]))
+        except CopyError as e:  # writing the tar itself failed (also when closing it)
+            raise _StagingWriteError(f"写入中转盘失败（空间不足？）：{e}") from e
 
         if not done:
             remove_quietly(tar_path)
-            with con:
-                con.execute("UPDATE batches SET tar_name=NULL, tar_size=NULL WHERE id=?", (batch["id"],))
             return
         try:  # read the tar back: every member must be there with the size we wrote
             members = list_tar(tar_path)
@@ -622,9 +732,11 @@ class Engine:
             raise EngineError(f"tar 包校验失败：{tar_path}（{e}）") from e
         if len(members) != len(done) or sum(m[1] for m in members) != sum(d[0] for d in done):
             raise EngineError(f"tar 包内容与预期不符：{tar_path}")
-        with con:  # members and tar size are recorded together: that pair is what marks the tar complete
+        with con:  # members, tar size and tar checksum are recorded together: that is what marks the tar complete
             con.executemany("UPDATE files SET status='STAGED', size=?, sha256=? WHERE id=?", done)
-            con.execute("UPDATE batches SET tar_size=? WHERE id=?", (_size(tar_path), batch["id"]))
+            con.execute(
+                "UPDATE batches SET tar_size=?, tar_sha256=? WHERE id=?", (_size(tar_path), tar.sha256, batch["id"])
+            )
 
     def _stage_raw(self, job: sqlite3.Row, rows: list[sqlite3.Row]) -> None:
         con = self.con
@@ -653,7 +765,7 @@ class Engine:
                     size, sha = future.result()
                 except CopyError as e:
                     if e.side == "dst":
-                        raise EngineError(f"写入中转盘失败（空间不足？）：{e}") from e
+                        raise _StagingWriteError(f"写入中转盘失败（空间不足？）：{e}") from e
                     self._source_failure(job, row, e)
                     continue
                 con.execute("UPDATE files SET status='STAGED', size=?, sha256=? WHERE id=?", (size, sha, row["id"]))
@@ -665,18 +777,35 @@ class Engine:
             pool.shutdown(wait=True, cancel_futures=True)
 
     def _source_failure(self, job: sqlite3.Row, row: sqlite3.Row, error: CopyError) -> None:
-        """A source file could not be read after retries: skip that file, or stop if the NAS itself is gone."""
+        """A source file could not be read after retries: skip that file, or pause the job if the NAS is gone."""
         if not os.path.isdir(long_path(job["source_path"])):
-            raise EngineError(
-                f"源文件夹无法访问：{job['source_path']}（{error.cause}）。"
-                "请检查 NAS 连接后重新点击开始，会从中断处继续。"
-            )
+            raise JobError(f"源文件夹无法访问：{job['source_path']}（{error.cause}）。请检查 NAS 连接。")
         with self.con:
             self.con.execute(
                 "UPDATE files SET status='FAILED', batch_id=NULL, error=? WHERE id=?", (str(error.cause), row["id"])
             )
+        if row["kind"] == "raw":  # a copy from an earlier interrupted run must not linger on the staging disk
+            self._remove_staged_raw(job["owner"], row["rel_path"])
         self.progress.drop(row["size"])
         self.log(f"警告：读取失败，已跳过：{row['rel_path']}（{error.cause}）")
+
+    def _release_unstaged(self, job: sqlite3.Row, batch_id: int) -> None:
+        """Take the files that are not staged out of the batch again, with their current sizes."""
+        con = self.con
+        rows = con.execute("SELECT * FROM files WHERE batch_id=? AND status='PENDING'", (batch_id,)).fetchall()
+        updates = []
+        for row in rows:
+            now_size = _size(os.path.join(job["source_path"], row["rel_path"]))
+            updates.append((row["size"] if now_size is None else now_size, row["id"]))
+            if row["kind"] == "raw":
+                self._remove_staged_raw(job["owner"], row["rel_path"])
+        with con:
+            con.executemany("UPDATE files SET batch_id=NULL, size=? WHERE id=?", updates)
+
+    def _remove_staged_raw(self, owner: str, rel_path: str) -> None:
+        path = raw_media_path(self.cfg.staging_root, owner, rel_path)
+        remove_quietly(path)
+        remove_quietly(path + PART_SUFFIX)
 
     # ------------------------------------------------------------ tape: staging disk -> tape
 
@@ -690,20 +819,27 @@ class Engine:
         nonraw = [r for r in rows if r["kind"] == "nonraw"]
         raw = sorted((r for r in rows if r["kind"] == "raw"), key=lambda r: r["rel_path"].lower())
 
-        # (label, source on staging disk, destination on tape, size, file row or None for the tar)
-        items: list[tuple[str, str, str, int, sqlite3.Row | None]] = []
+        # (label, source on staging disk, destination on tape, size, sha256, tape it was written to, file row or None for the tar)
+        items: list[tuple[str, str, str, int, str, str | None, sqlite3.Row | None]] = []
         if nonraw:
             name = batch["tar_name"]
             items.append((name, tar_media_path(staging, owner, name), tar_media_path(tape, owner, name),
-                          batch["tar_size"], None))
+                          batch["tar_size"], batch["tar_sha256"], batch["tar_written"], None))
         for r in raw:
             items.append((r["rel_path"], raw_media_path(staging, owner, r["rel_path"]),
-                          raw_media_path(tape, owner, r["rel_path"]), r["size"], r))
+                          raw_media_path(tape, owner, r["rel_path"]), r["size"], r["sha256"], r["written"], r))
 
-        # After an interruption, files that are already on tape with the right size are not written again.
-        on_tape_already = {i for i, item in enumerate(items) if _size(item[2]) == item[3]}
-        need = sum(item[3] for i, item in enumerate(items) if i not in on_tape_already)
-        self._ensure_tape(need)
+        # After an interruption, what this program recorded as completely written to the tape that is
+        # in the drive now (and is still there) is not written again. Asking for space may lead to a
+        # tape change, so repeat until the tape stays the same.
+        while True:
+            self._ensure_tape(0)
+            current = self.tape_id
+            written = {i for i, item in enumerate(items) if item[5] == current and _size(item[2]) == item[3]}
+            need = sum(item[3] for i, item in enumerate(items) if i not in written)
+            self._ensure_tape(need)
+            if self.tape_id == current:
+                break
         if batch["tape_id"] != self.tape_id:
             with con:
                 con.execute("UPDATE batches SET tape_id=? WHERE id=?", (self.tape_id, batch_id))
@@ -713,22 +849,17 @@ class Engine:
         self._begin_phase(job["id"], "tape", done=total - need, total=total, on_tape=total - need)
         self.log(f"第 {batch['seq']} 批：写入磁带 {self.tape_id}，{format_bytes(need)}")
 
-        for index, (label, src, dst, size, row) in enumerate(items):
+        for index, (label, src, dst, size, sha, _written, row) in enumerate(items):
             self._check_stop()
             self.progress.current_file = label
-            if index in on_tape_already:
-                if row is None and self._batch(batch_id)["tar_sha256"] is None:
-                    try:
-                        sha = hash_file(src, should_stop=self._stop.is_set)
-                    except OSError:
-                        sha = None
-                    con.execute("UPDATE batches SET tar_sha256=? WHERE id=?", (sha, batch_id))
-                    con.commit()
+            if index in written:
                 continue
             try:
-                _copied, sha = with_retry(
-                    lambda: copy_file(src, dst, should_stop=self._stop.is_set,
-                                      on_bytes=self.progress.add, chunk=TAPE_CHUNK),
+                # The data read back from the staging disk must be what was read from the NAS;
+                # only then does the file get its real name on tape.
+                with_retry(
+                    lambda: copy_file(src, dst, should_stop=self._stop.is_set, on_bytes=self.progress.add,
+                                      chunk=TAPE_CHUNK, expect_sha=sha),
                     delay=self._retry_delay,
                     should_stop=self._stop.is_set,
                 )
@@ -737,16 +868,13 @@ class Engine:
                     raise EngineError(
                         f"写入磁带失败：{e}。中转盘上的数据已保留，处理好磁带后重新点击开始即可继续。"
                     ) from e
-                self._requeue(job, batch, row, nonraw, size, f"中转盘上的文件无法读取（{e.cause}）")
+                self._requeue(job, batch, row, nonraw, size, f"中转盘上的副本无法读取或已损坏（{e.cause}）")
                 continue
             if row is None:
-                con.execute("UPDATE batches SET tar_sha256=? WHERE id=?", (sha, batch_id))
-                con.commit()
-            elif sha != row["sha256"]:
-                # What was read back from the staging disk is not what came from the NAS.
-                remove_quietly(dst)
-                self.progress.add(-size)
-                self._requeue(job, batch, row, nonraw, size, "中转盘上的副本与源文件校验值不一致")
+                con.execute("UPDATE batches SET tar_written=? WHERE id=?", (self.tape_id, batch_id))
+            else:
+                con.execute("UPDATE files SET written=? WHERE id=?", (self.tape_id, row["id"]))
+            con.commit()
 
         # Verify: every file of the batch must exist on tape with the expected size.
         rows = con.execute("SELECT * FROM files WHERE batch_id=? AND status='STAGED'", (batch_id,)).fetchall()
@@ -757,10 +885,10 @@ class Engine:
             return False
         staged_ids = {r["id"] for r in rows}
         has_tar = any(r["kind"] == "nonraw" for r in rows)
-        checks = [item for item in items if (item[4] is None and has_tar) or (item[4] is not None and item[4]["id"] in staged_ids)]
+        checks = [item for item in items if (has_tar if item[6] is None else item[6]["id"] in staged_ids)]
         self._begin_phase(job["id"], "verify", done=0, total=len(checks), unit="files",
                           on_tape=sum(item[3] for item in checks))
-        for label, _src, dst, size, _row in checks:
+        for label, _src, dst, size, _sha, _written, _row in checks:
             self._check_stop()
             self.progress.current_file = label
             on_tape = _size(dst)
@@ -775,21 +903,18 @@ class Engine:
         # Only now is the batch recorded as archived; _cleanup deletes staging copies based on this record.
         stamp = db.now()
         tar_size = batch["tar_size"] if has_tar else 0
+        new_raw_paths = {r["rel_path"].lower() for r in rows if r["kind"] == "raw"}
         with con:
-            earlier = con.execute(
-                "SELECT COUNT(*) FROM jobs WHERE owner=? COLLATE NOCASE AND id!=? AND legacy=0",
-                (owner, job["id"]),
-            ).fetchone()[0]
-            if earlier:
-                # A changed file was written over its old copy on this tape: the old record no longer exists there.
-                con.execute(
-                    "UPDATE files SET status='REPLACED' "
-                    "WHERE status='ARCHIVED' AND kind='raw' AND tape_id=? "
-                    "AND job_id IN (SELECT id FROM jobs WHERE owner=? COLLATE NOCASE) "
-                    "AND lower(rel_path) IN (SELECT lower(rel_path) FROM files "
-                    "                        WHERE batch_id=? AND kind='raw' AND status='STAGED')",
-                    (self.tape_id, owner, batch_id),
-                )
+            # A changed file was written over its old copy on this tape: the old record is no longer true.
+            old = con.execute(
+                "SELECT f.id, f.rel_path FROM files f JOIN jobs j ON j.id=f.job_id "
+                "WHERE j.owner=? COLLATE NOCASE AND f.status='ARCHIVED' AND f.kind='raw' AND f.tape_id=?",
+                (owner, self.tape_id),
+            ).fetchall() if new_raw_paths else []
+            con.executemany(
+                "UPDATE files SET status='REPLACED' WHERE id=?",
+                [(r["id"],) for r in old if r["rel_path"].lower() in new_raw_paths],
+            )
             con.execute(
                 "UPDATE files SET status='ARCHIVED', tape_id=?, "
                 "tar_name=CASE WHEN kind='nonraw' THEN ? END WHERE batch_id=? AND status='STAGED'",
@@ -814,7 +939,7 @@ class Engine:
             label = batch["tar_name"]
         else:
             targets = [row]
-            remove_quietly(raw_media_path(self.cfg.staging_root, owner, row["rel_path"]))
+            self._remove_staged_raw(owner, row["rel_path"])
             label = row["rel_path"]
         with con:
             for target in targets:
@@ -825,13 +950,14 @@ class Engine:
                     )
                 else:
                     con.execute(
-                        "UPDATE files SET status='PENDING', batch_id=NULL, sha256=NULL, attempts=attempts+1 "
-                        "WHERE id=?",
+                        "UPDATE files SET status='PENDING', batch_id=NULL, sha256=NULL, written=NULL, "
+                        "attempts=attempts+1 WHERE id=?",
                         (target["id"],),
                     )
             if row is None:
                 con.execute(
-                    "UPDATE batches SET tar_name=NULL, tar_size=NULL, tar_sha256=NULL WHERE id=?", (batch["id"],)
+                    "UPDATE batches SET tar_name=NULL, tar_size=NULL, tar_sha256=NULL, tar_written=NULL WHERE id=?",
+                    (batch["id"],),
                 )
         self.progress.drop(size)
         self.log(f"警告：{label}：{reason}，将重新暂存。")
@@ -842,7 +968,7 @@ class Engine:
         """Delete the staging copies of a batch that is recorded as ARCHIVED."""
         con = self.con
         batch = self._batch(batch["id"])
-        if batch["status"] != "ARCHIVED":  # the safety rule from the module docstring
+        if batch["status"] != "ARCHIVED":  # the first rule from the module docstring
             raise EngineError(f"内部错误：第 {batch['seq']} 批尚未归档，拒绝删除中转文件。")
         owner = job["owner"]
         stage_root = os.path.join(self.cfg.staging_root, archive_dir_name(owner))
@@ -879,6 +1005,7 @@ class Engine:
         while True:
             self._check_stop()
             suggested = None
+            confirming = ""
             if not os.path.isdir(root):
                 reason = f"找不到磁带盘 {root}，请插入磁带。"
             else:
@@ -897,6 +1024,14 @@ class Engine:
                         )
                     elif not self.tape_id:
                         reason = "请输入当前磁带的磁带号。"
+                    elif not marker and self._confirmed_unmarked != self.tape_id and self._tape_known(self.tape_id):
+                        # Two cartridges must never share an id: records would point at the wrong one.
+                        suggested = confirming = self.tape_id
+                        reason = (
+                            f"这盘磁带上还没有磁带号标记，但记录里已经有磁带 {self.tape_id} 的数据。\n"
+                            f"如果这就是那一盘（例如以前用旧脚本写过的磁带），请再次确认磁带号 {self.tape_id}；"
+                            "如果这是另一盘磁带，请输入一个新的磁带号。"
+                        )
                     elif free < need_bytes:
                         reason = (
                             f"磁带 {self.tape_id} 剩余空间不足（可用 {format_bytes(max(free, 0))}，"
@@ -915,8 +1050,15 @@ class Engine:
             new_id = normalize_tape_id(answer)
             if not new_id:
                 raise Stopped()
+            if new_id == confirming:
+                self._confirmed_unmarked = new_id
             self.tape_id = new_id
             self.progress.tape_id = new_id
+
+    def _tape_known(self, tape_id: str) -> bool:
+        return self.con.execute(
+            "SELECT 1 FROM batches WHERE tape_id=? AND status='ARCHIVED' LIMIT 1", (tape_id,)
+        ).fetchone() is not None
 
     # ------------------------------------------------------------ helpers
 
@@ -973,3 +1115,13 @@ def _size(path: str | None) -> int | None:
         return os.stat(long_path(path)).st_size
     except OSError:
         return None
+
+
+def _real(path: str) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _overlaps(a: str, b: str) -> bool:
+    """True if one of the two (normalised) paths is the other or lies inside it."""
+    a, b = a.rstrip(os.sep), b.rstrip(os.sep)
+    return a == b or a.startswith(b + os.sep) or b.startswith(a + os.sep)

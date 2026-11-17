@@ -150,6 +150,13 @@ class Env:
             return self.tape_cap - dir_bytes(self.drive)
         return BIG
 
+    def disk_total(self, path: str) -> int:
+        if norm(path) == norm(self.staging) and self.stage_cap is not None:
+            return self.stage_cap
+        if norm(path) == norm(self.drive) and self.tape_cap is not None:
+            return self.tape_cap
+        return BIG
+
     def staging_files(self) -> dict[str, int]:
         return files_under(self.staging)
 
@@ -160,7 +167,8 @@ class Env:
             if on_log:
                 on_log(line)
 
-        return Engine(self.cfg, on_log=log, ask_tape=ask_tape, disk_free=self.disk_free, retry_delay=0, **kw)
+        return Engine(self.cfg, on_log=log, ask_tape=ask_tape, disk_free=self.disk_free,
+                      disk_total=self.disk_total, retry_delay=0, **kw)
 
     def run(self, tape="T1", ask=None, on_log=None):
         return self.engine(ask_tape=ask, on_log=on_log).run(tape)
@@ -1132,7 +1140,7 @@ def test_source_folder_disappears_mid_run(env, monkeypatch, when):
 def test_source_folder_missing_at_scan(env):
     job_id = env.add_job("Oz", str(env.nas / "Oz"))
     status, message = env.run("T1")
-    assert status == "error" and "无法读取源文件夹" in message
+    assert status == "error" and "源文件夹不存在或无法访问" in message
     assert env.one("SELECT scanned FROM jobs WHERE id=?", job_id)["scanned"] == 0
     spec = mixed_spec()
     env.make_source("Oz", spec)
@@ -1264,8 +1272,6 @@ def test_changed_file_on_another_tape_keeps_old_record(env):
         con.close()
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: corruption of the staged tar is never detected (tar_sha256 is "
-                                       "taken from the corrupted staging copy, member hashes are not re-checked)")
 def test_staged_tar_corrupted_before_tape(env, monkeypatch):
     spec = mixed_spec()
     env.make_source("Rae", spec)
@@ -1688,8 +1694,11 @@ def test_with_retry():
 def test_long_path():
     if os.name != "nt":
         pytest.skip("windows only")
-    short = "C:\\a\\b.txt"
-    assert long_path(short) == short
+    # Every absolute path gets the prefix (so names ending in a dot or space are taken literally);
+    # a relative path is left alone.
+    assert long_path("C:\\a\\b.txt") == "\\\\?\\C:\\a\\b.txt"
+    assert long_path("C:/a/b.txt") == "\\\\?\\C:\\a\\b.txt"
+    assert long_path("a\\b.txt") == "a\\b.txt"
     p = "C:\\" + "a" * 300
     assert long_path(p) == "\\\\?\\" + p
     assert long_path(long_path(p)) == long_path(p)
@@ -1735,9 +1744,6 @@ def test_progress_snapshot_in_range(env, monkeypatch):
 
 # ====================================================================== suspected bugs (xfail strict)
 
-@pytest.mark.xfail(strict=True, reason="BUG: _to_tape decides which files are 'already on tape' BEFORE "
-                                       "_ensure_tape may switch tapes; after a swap the skipped files are "
-                                       "missing on the new tape and verification fails")
 def test_tape_swap_on_resume_after_partial_write(env, monkeypatch):
     spec = {"a.raw": blob("a", 20_000), "b.raw": blob("b", 20_000), "c.raw": blob("c", 20_000)}
     env.make_source("Sam", spec)
@@ -1762,9 +1768,6 @@ def test_tape_swap_on_resume_after_partial_write(env, monkeypatch):
     check_backup(env, "Sam", spec, strict_tape=False)
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: a changed raw file is written over its archived old version in "
-                                       "place; when the new copy is then discarded (sha mismatch) the old "
-                                       "version is gone from tape but its record stays ARCHIVED")
 def test_overwrite_then_requeue_loses_old_version(env, monkeypatch):
     v1 = {"a.raw": blob("a", 20_000), "b.raw": blob("b", 20_000)}
     env.make_source("Tom", v1)
@@ -1792,9 +1795,6 @@ def test_overwrite_then_requeue_loses_old_version(env, monkeypatch):
         assert content is not None and sha(content) == r["sha256"], f"record lies: {r['rel_path']} {r['size']}"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: stopping while a changed raw file is written over its old "
-                                       "version deletes the old version; after abandon_job its record is "
-                                       "still ARCHIVED")
 def test_stop_while_overwriting_then_abandon(env, monkeypatch):
     v1 = {"a.raw": blob("a", 200_000)}
     env.make_source("Tom", v1)
@@ -1820,9 +1820,6 @@ def test_stop_while_overwriting_then_abandon(env, monkeypatch):
         assert content is not None and sha(content) == r["sha256"], f"record lies: {r['rel_path']} {r['size']}"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: 'already on tape' is decided by size only; an unrecorded file "
-                                       "left on tape by an abandoned job is taken for the new version of a "
-                                       "same-size file, which is then never written")
 def test_orphan_on_tape_taken_for_new_version(env, monkeypatch):
     v1 = {"a.raw": blob("a", 20_000)}
     env.make_source("Una", v1)
@@ -1839,9 +1836,6 @@ def test_orphan_on_tape_taken_for_new_version(env, monkeypatch):
     check_backup(env, "Una", v2)
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: REPLACED uses SQLite lower(), which folds ASCII only; a case "
-                                       "rename of a non-ASCII name overwrites the old file on the "
-                                       "case-insensitive tape but leaves its record ARCHIVED")
 def test_non_ascii_case_rename_marks_replaced(env):
     env.make_source("Vic", {"Äb.raw": blob("a", 1_000)})
     job1 = env.add_job("Vic")
@@ -1854,8 +1848,6 @@ def test_non_ascii_case_rename_marks_replaced(env):
     assert old["status"] == "REPLACED", "old record still claims 1000 bytes that were overwritten on tape"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: an unreadable sub-folder at scan time is only logged; its files "
-                                       "never become rows, and the job ends DONE with 0 failed files")
 def test_unreadable_subfolder_is_not_silently_dropped(env, monkeypatch):
     spec = mixed_spec()
     spec["locked\\secret.raw"] = blob("s", 1000)
@@ -1876,8 +1868,6 @@ def test_unreadable_subfolder_is_not_silently_dropped(env, monkeypatch):
         f"job finished as {job['status']} with failed_files={job['failed_files']}: {message}")
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: a staging copy finished but not yet recorded is never cleaned "
-                                       "when that source file later fails (FAILED rows are not cleaned)")
 def test_no_staging_leak_after_crash_and_source_loss(env, monkeypatch):
     spec = mixed_spec()
     env.make_source("Xia", spec)
@@ -1899,8 +1889,6 @@ def test_no_staging_leak_after_crash_and_source_loss(env, monkeypatch):
     check_backup(env, "Xia", good, failed=("r2.raw",))
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: _plan_batch reserves TAR_END_OVERHEAD whenever any non-raw file "
-                                       "is pending, then fails ALL remaining files although a raw file fits")
 def test_raw_file_that_fits_is_not_failed(env):
     spec = {"fits.raw": blob("f", 95_000), "huge.txt": blob("h", 200_000)}
     env.make_source("Yan", spec)
@@ -1910,8 +1898,6 @@ def test_raw_file_that_fits_is_not_failed(env):
     assert env.file_row("fits.raw")["status"] == "ARCHIVED"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: files failed by _plan_batch (too large) are not reflected in the "
-                                       "progress; job_done stays below job_total after the job finished")
 def test_progress_complete_after_too_large_file(env):
     spec = {"big.raw": blob("big", 200_000), "s.raw": blob("s", 20_000)}
     env.make_source("Zoe", spec)
@@ -1923,9 +1909,6 @@ def test_progress_complete_after_too_large_file(env):
     assert snap["job_done"] == snap["job_total"], snap
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: a batch is planned once with scan-time sizes; if a file grew and "
-                                       "the batch no longer fits on staging, every resume hits the same "
-                                       "'staging disk full' error forever")
 def test_file_grown_past_staging_budget_does_not_block_job(env, monkeypatch):
     spec = {"a.raw": blob("a", 25_000), "b.raw": blob("b", 25_000)}
     env.make_source("Abe", spec)
@@ -1952,24 +1935,158 @@ def test_file_grown_past_staging_budget_does_not_block_job(env, monkeypatch):
     assert results[-1][0] == "done", results
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: TAR_MEMBER_OVERHEAD (2048) is too small for long non-ASCII "
-                                       "names (PAX record > 512 bytes); the tar outgrows the planned budget")
 def test_tar_fits_planned_budget_with_long_chinese_names(env):
     spec = {("子" * 200) + f"{i:02}.txt": blob(str(i), 513) for i in range(40)}
     env.make_source("Bea", spec)
     env.add_job("Bea")
-    env.stage_cap = 40 * (513 + eng.TAR_MEMBER_OVERHEAD) + eng.TAR_END_OVERHEAD
+    env.stage_cap = sum(eng.tar_member_cost("Bea", rel, 513) for rel in spec) + eng.TAR_END_OVERHEAD
     assert env.run("T1")[0] == "done"
     for b in env.rows("SELECT * FROM batches"):
         assert b["tar_size"] <= env.stage_cap, f"tar of {b['tar_size']} bytes on a {env.stage_cap}-byte disk"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: names ending in '.' or ' ' are listed via FindFirstFile but opened "
-                                       "without the \\\\?\\ prefix, so Windows strips the dot/space and the "
-                                       "twin file is backed up instead")
 def test_trailing_dot_name_backs_up_its_own_content(env):
     spec = {"notes": blob("plain", 1000), "notes.": blob("dot", 1000), "x.raw": blob("x", 100)}
     env.make_source("Cal", spec)
     env.add_job("Cal")
     assert env.run("T1")[0] == "done"
     check_backup(env, "Cal", spec)
+
+
+# ====================================================================== protections added after the code review
+
+def test_source_inside_own_staging_folder_is_refused(env):
+    """A leftover <staging>\\Li_archive\\Li folder queued as a source must never be staged onto itself."""
+    src = env.staging / "Li_archive" / "Li"
+    data = blob("y", 5_000)
+    write(src / "y.raw", data)
+    env.add_job("Li", str(src))
+    status, message = env.run("T1")
+    assert status == "error" and "重叠" in message
+    assert (src / "y.raw").read_bytes() == data
+    assert env.one("SELECT status FROM jobs")["status"] == "QUEUED"
+    assert env.rows("SELECT * FROM files") == []
+
+
+def test_copy_file_refuses_same_file(tmp_path):
+    path = tmp_path / "same.bin"
+    data = blob("same", 3_000)
+    write(path, data)
+    with pytest.raises(CopyError) as info:
+        copy_file(str(path), str(path))
+    assert info.value.side == "dst"
+    assert path.read_bytes() == data
+
+
+def test_bad_source_does_not_block_the_next_job(env):
+    env.add_job("Gone", str(env.nas / "Gone"))  # folder does not exist
+    spec = {"a.raw": blob("a", 4_000), "b.txt": blob("b", 2_000)}
+    env.make_source("Here", spec)
+    env.add_job("Here")
+    status, message = env.run("T1")
+    assert status == "error" and "Gone" in message
+    check_backup(env, "Here", spec)
+
+
+def test_invalid_owner_name_is_refused(env):
+    env.make_source("ok", {"a.raw": blob("a", 100)})
+    env.add_job("bad:name", str(env.nas / "ok"))
+    status, message = env.run("T1")
+    assert status == "error" and "不能用作文件夹名" in message
+    assert files_under(env.drive) == {}
+
+
+def test_same_size_but_newer_file_is_backed_up_again(env):
+    """Result databases change in whole pages: same size, different content and modification time."""
+    env.make_source("Mo", {"r.msf": blob("v1", 8_192), "keep.raw": blob("k", 3_000)})
+    env.add_job("Mo")
+    assert env.run("T1")[0] == "done"
+    new = blob("v2", 8_192)
+    write(env.src("Mo", "r.msf"), new)
+    os.utime(lp(env.src("Mo", "r.msf")), (2_000_000_000, 2_000_000_000))
+    job2 = env.add_job("Mo")
+    assert env.run("T1")[0] == "done"
+    assert env.one("SELECT total_files FROM jobs WHERE id=?", job2)["total_files"] == 1
+    row = env.file_row("r.msf", job2)
+    assert row["status"] == "ARCHIVED" and row["sha256"] == hashlib.sha256(new).hexdigest()
+
+
+def test_unmarked_tape_with_known_id_needs_confirmation(env):
+    """A tape without a marker must not silently take an id the records already use for another tape."""
+    env.make_source("Na", {"a.raw": blob("a", 2_000)})
+    env.add_job("Na")
+    assert env.run("T1")[0] == "done"
+    for name in os.listdir(env.drive):  # "another cartridge": nothing on it, no marker
+        path = env.drive / name
+        shutil.rmtree(path) if path.is_dir() else path.unlink()
+
+    env.make_source("Nb", {"b.raw": blob("b", 2_000)})
+    env.add_job("Nb")
+    calls = []
+
+    def ask(reason, suggested):
+        calls.append(reason)
+        return "T2"
+
+    assert env.run("T1", ask=ask)[0] == "done"
+    assert len(calls) == 1 and "已经有磁带 T1 的数据" in calls[0]
+    assert env.file_row("b.raw")["tape_id"] == "T2"
+
+    # Confirming the same id is accepted (a tape written by the old scripts has no marker either).
+    for name in os.listdir(env.drive):
+        path = env.drive / name
+        shutil.rmtree(path) if path.is_dir() else path.unlink()
+    env.make_source("Nc", {"c.raw": blob("c", 2_000)})
+    env.add_job("Nc")
+    assert env.run("T1", ask=lambda reason, suggested: suggested)[0] == "done"
+    assert env.file_row("c.raw")["tape_id"] == "T1"
+
+
+def test_staging_disk_temporarily_full_pauses_instead_of_failing(env):
+    spec = {"a.raw": blob("a", 30_000), "b.raw": blob("b", 30_000)}
+    env.make_source("Ola", spec)
+    env.add_job("Ola")
+    env.stage_cap = 100_000
+    write(env.staging / "someone_elses_data.bin", b"x" * 90_000)  # leaves 10 KB: nothing fits right now
+    status, message = env.run("T1")
+    assert status == "error" and "空间不足" in message
+    assert env.rows("SELECT * FROM files WHERE status='FAILED'") == []
+    os.remove(env.staging / "someone_elses_data.bin")
+    assert env.run("T1")[0] == "done"
+    check_backup(env, "Ola", spec)
+
+
+def test_tape_write_error_is_not_retried(env, monkeypatch):
+    env.make_source("Pia", {"a.raw": blob("a", 5_000)})
+    env.add_job("Pia")
+    attempts = []
+
+    def hook(real, src, dst, kw):
+        if under(dst, env.drive):
+            attempts.append(dst)
+            raise CopyError("dst", dst, OSError(28, "No space left on device"))
+        return real(src, dst, **kw)
+
+    patch_copy(monkeypatch, hook)
+    status, message = env.run("T1")
+    assert status == "error" and "写入磁带失败" in message
+    assert len(attempts) == 1
+    assert dir_bytes(env.staging) == 5_000  # the staged copy is kept
+
+
+def test_stop_requested_before_run_is_honoured(env):
+    env.make_source("Quy", {"a.raw": blob("a", 5_000)})
+    env.add_job("Quy")
+    e = env.engine()
+    e.stop()
+    assert e.run("T1") == ("stopped", "")
+    assert files_under(env.staging) == {}
+
+
+def test_no_part_files_left_after_a_complete_run(env):
+    spec = mixed_spec()
+    env.make_source("Rui", spec)
+    env.add_job("Rui")
+    assert env.run("T1")[0] == "done"
+    assert not [name for name in files_under(env.drive) if name.endswith(".part")]
+    assert files_under(env.staging) == {}
