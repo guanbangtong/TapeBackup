@@ -21,7 +21,7 @@ from . import db
 from .config import Config
 from .copier import format_bytes
 from .ui_records import NumItem, make_table
-from .ui_style import BORDER, MUTED, NUMBER_FONT, PRIMARY, PRIMARY_SOFT, SURFACE, TEXT, UI_FONT, card, label, page_margins
+from .ui_style import BORDER, bulk_update, MUTED, NUMBER_FONT, PRIMARY, PRIMARY_SOFT, SURFACE, TEXT, UI_FONT, card, label, page_margins
 
 EMPTY = "还没有备份记录"
 
@@ -238,23 +238,22 @@ class StatsPage(QWidget):
         self.empty_label.setVisible(not self.rows)
 
         t = self.table
-        t.setSortingEnabled(False)
-        t.setRowCount(len(self.rows))
-        for i, r in enumerate(self.rows):
-            size = r["bytes"] or 0
-            tapes = tapes_text(r)
-            share = size / total if total else 0
-            cells = [
-                QTableWidgetItem(r["owner"]),
-                NumItem(format_bytes(size), size),
-                NumItem(share_text(size, total), share),
-                QTableWidgetItem(tapes),
-            ]
-            cells[0].setToolTip(r["owner"])
-            cells[3].setToolTip(tapes)
-            for col, item in enumerate(cells):
-                t.setItem(i, col, item)
-        t.setSortingEnabled(True)
+        with bulk_update(t):
+            t.setRowCount(len(self.rows))
+            for i, r in enumerate(self.rows):
+                size = r["bytes"] or 0
+                tapes = tapes_text(r)
+                share = size / total if total else 0
+                cells = [
+                    QTableWidgetItem(r["owner"]),
+                    NumItem(format_bytes(size), size),
+                    NumItem(share_text(size, total), share),
+                    QTableWidgetItem(tapes),
+                ]
+                cells[0].setToolTip(r["owner"])
+                cells[3].setToolTip(tapes)
+                for col, item in enumerate(cells):
+                    t.setItem(i, col, item)
         t.sortByColumn(1, Qt.DescendingOrder)
 
         self.status.setText(f"共 {format_bytes(total)}，{len(self.rows)} 个名称，{tape_count} 盘磁带" if self.rows else "")

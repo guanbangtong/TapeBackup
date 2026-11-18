@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 from . import db
 from .config import Config
 from .copier import format_bytes
-from .ui_style import label, page_margins, setup_table
+from .ui_style import bulk_update, label, page_margins, setup_table
 
 LIMIT = 2000
 ALL = "全部"
@@ -200,24 +200,23 @@ class SearchPage(QWidget):
             self.empty_label.setText(text)
 
     def _fill(self) -> None:
-        self.table.setSortingEnabled(False)  # keep row indexes stable while filling
-        self.table.setRowCount(len(self.rows))
-        for i, r in enumerate(self.rows):
-            cells = [
-                QTableWidgetItem(r["rel_path"]),
-                SizeItem(r["size"]),
-                QTableWidgetItem(r["owner"]),
-                QTableWidgetItem(r["tape_id"] or ""),
-                QTableWidgetItem(r["archived_at"] or ""),
-                QTableWidgetItem(placement(r)),
-            ]
-            cells[0].setData(Qt.UserRole, i)  # index into self.rows, survives sorting
-            cells[0].setToolTip(r["rel_path"])
-            if r["kind"] != "raw":
-                cells[5].setToolTip(f"打包在 {r['tar_name']}")
-            for col, item in enumerate(cells):
-                self.table.setItem(i, col, item)
-        self.table.setSortingEnabled(True)
+        with bulk_update(self.table):
+            self.table.setRowCount(len(self.rows))
+            for i, r in enumerate(self.rows):
+                cells = [
+                    QTableWidgetItem(r["rel_path"]),
+                    SizeItem(r["size"]),
+                    QTableWidgetItem(r["owner"]),
+                    QTableWidgetItem(r["tape_id"] or ""),
+                    QTableWidgetItem(r["archived_at"] or ""),
+                    QTableWidgetItem(placement(r)),
+                ]
+                cells[0].setData(Qt.UserRole, i)  # index into self.rows, survives sorting
+                cells[0].setToolTip(r["rel_path"])
+                if r["kind"] != "raw":
+                    cells[5].setToolTip(f"打包在 {r['tar_name']}")
+                for col, item in enumerate(cells):
+                    self.table.setItem(i, col, item)
         self._show_empty(None if self.rows else EMPTY_NO_HITS)
         text = f"找到 {len(self.rows)} 个文件"
         if len(self.rows) >= LIMIT:

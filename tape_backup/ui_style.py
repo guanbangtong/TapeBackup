@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPalette, QPen
@@ -234,6 +236,29 @@ def setup_table(table: QTableWidget, *, multi_select: bool = False, row_height: 
     header.setHighlightSections(False)
     header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
     header.setSectionResizeMode(QHeaderView.Interactive)
+
+
+@contextmanager
+def bulk_update(table: QTableWidget) -> Iterator[None]:
+    """Fill or filter many rows of a table at once, fast.
+
+    A ResizeToContents column is measured again over ALL rows after every single cell change, so
+    filling n rows one cell at a time costs about n * n measurements (300 records took 18 s).
+    Inside this block such columns are left alone and sorting is off; at the end each column is
+    measured once.
+    """
+    header = table.horizontalHeader()
+    auto = [c for c in range(table.columnCount()) if header.sectionResizeMode(c) == QHeaderView.ResizeToContents]
+    sorting = table.isSortingEnabled()
+    table.setSortingEnabled(False)
+    for c in auto:
+        header.setSectionResizeMode(c, QHeaderView.Interactive)
+    try:
+        yield
+    finally:
+        for c in auto:
+            header.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        table.setSortingEnabled(sorting)
 
 
 def status_item(kind: str, text: str) -> QTableWidgetItem:

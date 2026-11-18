@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from . import db
 from .config import Config
 from .copier import format_bytes
-from .ui_style import label, page_margins, setup_table, status_item
+from .ui_style import bulk_update, label, page_margins, setup_table, status_item
 
 HEADERS = ["日期", "名称", "磁带号", "大小", "文件数", "批次", "状态", "NAS 源数据", "源文件夹"]
 LEGACY_COLUMNS = {"date", "tape_id", "owner", "size_tb"}
@@ -194,31 +194,30 @@ class RecordsPage(QWidget):
             return
 
         t = self.table
-        t.setSortingEnabled(False)
-        t.setRowCount(len(self.jobs))
-        for i, j in enumerate(self.jobs):
-            stamp = (j["finished_at"] or j["created_at"])[:16]  # no seconds
-            files = "—" if j["legacy"] else str(j["done_files"])
-            cells = [
-                QTableWidgetItem(stamp),
-                QTableWidgetItem(j["owner"]),
-                QTableWidgetItem(j["tapes"] or ""),
-                NumItem(format_bytes(j["done_bytes"]), j["done_bytes"]),
-                NumItem(files, -1 if j["legacy"] else j["done_files"]),
-                NumItem(str(j["batch_count"]), j["batch_count"]),
-                status_item(*status_cell(j)),
-                QTableWidgetItem(),
-                QTableWidgetItem(j["source_path"]),
-            ]
-            kind, text, tip = source_cell(j)
-            if kind:
-                cells[7] = status_item(kind, text)
-                cells[7].setToolTip(tip)
-            cells[0].setData(Qt.UserRole, i)  # index into self.jobs, survives sorting
-            cells[8].setToolTip(j["source_path"])
-            for col, item in enumerate(cells):
-                t.setItem(i, col, item)
-        t.setSortingEnabled(True)
+        with bulk_update(t):
+            t.setRowCount(len(self.jobs))
+            for i, j in enumerate(self.jobs):
+                stamp = (j["finished_at"] or j["created_at"])[:16]  # no seconds
+                files = "—" if j["legacy"] else str(j["done_files"])
+                cells = [
+                    QTableWidgetItem(stamp),
+                    QTableWidgetItem(j["owner"]),
+                    QTableWidgetItem(j["tapes"] or ""),
+                    NumItem(format_bytes(j["done_bytes"]), j["done_bytes"]),
+                    NumItem(files, -1 if j["legacy"] else j["done_files"]),
+                    NumItem(str(j["batch_count"]), j["batch_count"]),
+                    status_item(*status_cell(j)),
+                    QTableWidgetItem(),
+                    QTableWidgetItem(j["source_path"]),
+                ]
+                kind, text, tip = source_cell(j)
+                if kind:
+                    cells[7] = status_item(kind, text)
+                    cells[7].setToolTip(tip)
+                cells[0].setData(Qt.UserRole, i)  # index into self.jobs, survives sorting
+                cells[8].setToolTip(j["source_path"])
+                for col, item in enumerate(cells):
+                    t.setItem(i, col, item)
         t.sortByColumn(0, Qt.DescendingOrder)
         if selected_id is not None:
             for r in range(t.rowCount()):
@@ -227,13 +226,12 @@ class RecordsPage(QWidget):
                     break
 
         tt = self.tape_table
-        tt.setSortingEnabled(False)
-        tt.setRowCount(len(tapes))
-        for i, r in enumerate(tapes):
-            tt.setItem(i, 0, QTableWidgetItem(r["tape_id"]))
-            tt.setItem(i, 1, NumItem(format_bytes(r["bytes"] or 0), r["bytes"] or 0))
-            tt.setItem(i, 2, QTableWidgetItem((r["last_used"] or "")[:10]))
-        tt.setSortingEnabled(True)
+        with bulk_update(tt):
+            tt.setRowCount(len(tapes))
+            for i, r in enumerate(tapes):
+                tt.setItem(i, 0, QTableWidgetItem(r["tape_id"]))
+                tt.setItem(i, 1, NumItem(format_bytes(r["bytes"] or 0), r["bytes"] or 0))
+                tt.setItem(i, 2, QTableWidgetItem((r["last_used"] or "")[:10]))
 
         self.tape_count = len(tapes)
         self._apply_find()
@@ -251,10 +249,11 @@ class RecordsPage(QWidget):
         words = self._words()
         t = self.table
         shown = 0
-        for r in range(t.rowCount()):
-            hide = not job_matches(self.jobs[t.item(r, 0).data(Qt.UserRole)], words)
-            t.setRowHidden(r, hide)
-            shown += not hide
+        with bulk_update(t):
+            for r in range(t.rowCount()):
+                hide = not job_matches(self.jobs[t.item(r, 0).data(Qt.UserRole)], words)
+                t.setRowHidden(r, hide)
+                shown += not hide
         for index in t.selectionModel().selectedRows():
             if t.isRowHidden(index.row()):
                 t.clearSelection()
@@ -329,11 +328,12 @@ class RecordsPage(QWidget):
         dlg.setWindowTitle(f"失败的文件 - {job['owner']}")
         dlg.resize(820, 420)
         table = make_table(["文件", "大小", "原因"])
-        table.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            table.setItem(i, 0, QTableWidgetItem(r["rel_path"]))
-            table.setItem(i, 1, NumItem(format_bytes(r["size"]), r["size"]))
-            table.setItem(i, 2, QTableWidgetItem(r["error"] or ""))
+        with bulk_update(table):
+            table.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                table.setItem(i, 0, QTableWidgetItem(r["rel_path"]))
+                table.setItem(i, 1, NumItem(format_bytes(r["size"]), r["size"]))
+                table.setItem(i, 2, QTableWidgetItem(r["error"] or ""))
         fh = table.horizontalHeader()
         fh.setStretchLastSection(False)
         fh.setSectionResizeMode(0, QHeaderView.Stretch)
