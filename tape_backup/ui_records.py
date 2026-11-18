@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QTableWidget,
@@ -72,6 +73,12 @@ def source_text(job: sqlite3.Row) -> str:
     return source_cell(job)[1]
 
 
+def job_matches(job: sqlite3.Row, words: list[str]) -> bool:
+    """True if every word (lower case) appears in the job's name, tape ids or source folder."""
+    text = f"{job['owner']} {job['tapes'] or ''} {job['source_path']}".lower()
+    return all(w in text for w in words)
+
+
 def make_table(headers: list[str], multi_select: bool = False) -> QTableWidget:
     t = QTableWidget(0, len(headers))
     t.setHorizontalHeaderLabels(headers)
@@ -89,6 +96,7 @@ class RecordsPage(QWidget):
         self.con: sqlite3.Connection | None = None
         self.db_path = ""
         self.jobs: list[sqlite3.Row] = []
+        self.tape_count = 0
 
         self.table = make_table(HEADERS)
         self.table.setSortingEnabled(True)
@@ -111,6 +119,11 @@ class RecordsPage(QWidget):
         tape_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.tape_table.horizontalHeaderItem(1).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
+        self.find = QLineEdit()
+        self.find.setPlaceholderText("查找名称、磁带号或文件夹")
+        self.find.setClearButtonEnabled(True)
+        self.find.setMinimumWidth(230)
+
         self.refresh_button = QPushButton("刷新")
         self.import_button = QPushButton("导入旧记录…")
         self.export_button = QPushButton("导出 CSV…")
@@ -126,6 +139,8 @@ class RecordsPage(QWidget):
         top.addSpacing(4)
         top.addWidget(self.status)
         top.addStretch(1)
+        top.addWidget(self.find)
+        top.addSpacing(4)
         for b in (self.refresh_button, self.import_button, self.export_button, self.failed_button, self.restore_button):
             top.addWidget(b)
 
@@ -153,6 +168,7 @@ class RecordsPage(QWidget):
         self.failed_button.clicked.connect(self.show_failed)
         self.restore_button.clicked.connect(self.restore)
         self.table.itemSelectionChanged.connect(self._selection_changed)
+        self.find.textChanged.connect(self._apply_find)
 
         self.refresh()
 
@@ -219,7 +235,34 @@ class RecordsPage(QWidget):
             tt.setItem(i, 2, QTableWidgetItem((r["last_used"] or "")[:10]))
         tt.setSortingEnabled(True)
 
-        self.status.setText(f"共 {len(self.jobs)} 条，{len(tapes)} 盘磁带")
+        self.tape_count = len(tapes)
+        self._apply_find()
+
+    def _words(self) -> list[str]:
+        return self.find.text().lower().split()
+
+    def visible_jobs(self) -> list[sqlite3.Row]:
+        """The records the find box lets through, newest first."""
+        words = self._words()
+        return [j for j in self.jobs if job_matches(j, words)]
+
+    def _apply_find(self) -> None:
+        """Hide the rows that do not match the find box."""
+        words = self._words()
+        t = self.table
+        shown = 0
+        for r in range(t.rowCount()):
+            hide = not job_matches(self.jobs[t.item(r, 0).data(Qt.UserRole)], words)
+            t.setRowHidden(r, hide)
+            shown += not hide
+        for index in t.selectionModel().selectedRows():
+            if t.isRowHidden(index.row()):
+                t.clearSelection()
+                break
+        if words:
+            self.status.setText(f"找到 {shown} 条（共 {len(self.jobs)} 条）")
+        else:
+            self.status.setText(f"共 {len(self.jobs)} 条，{self.tape_count} 盘磁带")
         self._selection_changed()
 
     def selected_job(self) -> sqlite3.Row | None:
@@ -257,7 +300,8 @@ class RecordsPage(QWidget):
         return True
 
     def export_csv(self, path: str | None = None) -> bool:
-        if not self.jobs:
+        jobs = self.visible_jobs()  # what the find box shows; everything when it is empty
+        if not jobs:
             QMessageBox.information(self, "导出", "当前没有记录可导出。")
             return False
         if path is None:
@@ -268,7 +312,7 @@ class RecordsPage(QWidget):
             with open(path, "w", encoding="utf-8-sig", newline="") as f:  # BOM so Excel reads Chinese correctly
                 w = csv.writer(f)
                 w.writerow(HEADERS)
-                for j in self.jobs:
+                for j in jobs:
                     w.writerow([
                         j["finished_at"] or j["created_at"], j["owner"], j["tapes"] or "", j["done_bytes"],
                         "" if j["legacy"] else j["done_files"], j["batch_count"], status_text(j), source_text(j), j["source_path"],
@@ -276,7 +320,7 @@ class RecordsPage(QWidget):
         except OSError as e:
             QMessageBox.warning(self, "导出", f"无法写入文件：\n{e}")
             return False
-        self.status.setText(f"已导出 {len(self.jobs)} 条到 {path}")
+        self.status.setText(f"已导出 {len(jobs)} 条到 {path}")
         return True
 
     def failed_dialog(self, job: sqlite3.Row) -> QDialog:

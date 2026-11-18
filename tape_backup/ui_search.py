@@ -8,6 +8,7 @@ import sqlite3
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
+    QCompleter,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -48,6 +49,35 @@ def placement(row: sqlite3.Row) -> str:
     return "直接存放" if row["kind"] == "raw" else "tar 包"
 
 
+def filter_box(min_width: int) -> QComboBox:
+    """A list to pick from that also takes typing: typed text pops up every entry that contains it."""
+    box = QComboBox()
+    box.setEditable(True)
+    box.setInsertPolicy(QComboBox.NoInsert)  # typed text is a filter, not a new entry
+    box.setMinimumWidth(min_width)
+    box.lineEdit().setPlaceholderText(ALL)
+    completer = box.completer()
+    completer.setFilterMode(Qt.MatchContains)
+    completer.setCaseSensitivity(Qt.CaseInsensitive)
+    completer.setCompletionMode(QCompleter.PopupCompletion)
+    return box
+
+
+def box_filter(box: QComboBox) -> tuple[str | None, str | None]:
+    """(whole name, part of a name) for what a filter box holds; (None, None) means no filter.
+
+    Text that is exactly one of the listed names selects that name only; any other text matches
+    every name that contains it ("li" finds LiHua and Lily).
+    """
+    text = box.currentText().strip()
+    if text in ("", ALL):
+        return None, None
+    for i in range(1, box.count()):
+        if box.itemText(i).lower() == text.lower():
+            return box.itemText(i), None
+    return None, text
+
+
 class SearchPage(QWidget):
     def __init__(self, cfg: Config, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -59,10 +89,10 @@ class SearchPage(QWidget):
 
         self.keyword = QLineEdit()
         self.keyword.setPlaceholderText("输入文件名或路径中的关键字，多个词用空格隔开")
-        self.owner_box = QComboBox()
-        self.owner_box.setMinimumWidth(140)
-        self.tape_box = QComboBox()
-        self.tape_box.setMinimumWidth(120)
+        self.owner_box = filter_box(160)
+        self.owner_box.setToolTip("可以直接输入名称的一部分，例如 li")
+        self.tape_box = filter_box(130)
+        self.tape_box.setToolTip("可以直接输入磁带号的一部分")
         self.search_button = QPushButton("搜索")
         self.search_button.setProperty("primary", True)
 
@@ -112,6 +142,8 @@ class SearchPage(QWidget):
 
         self.search_button.clicked.connect(self.search)
         self.keyword.returnPressed.connect(self.search)
+        self.owner_box.lineEdit().returnPressed.connect(self.search)
+        self.tape_box.lineEdit().returnPressed.connect(self.search)
         self.export_button.clicked.connect(lambda: self.export_csv())
         self.restore_button.clicked.connect(self.restore)
         self.table.itemSelectionChanged.connect(self._selection_changed)
@@ -141,19 +173,19 @@ class SearchPage(QWidget):
             current = box.currentText()
             box.clear()
             box.addItems([ALL] + items)
-            box.setCurrentIndex(max(box.findText(current), 0))
+            index = box.findText(current)
+            if index >= 0:
+                box.setCurrentIndex(index)
+            else:
+                box.setEditText(current)  # keep what was typed, even if no name matches it exactly
 
     def search(self) -> None:
         try:
             con = self._connect()
-            owner = self.owner_box.currentText()
-            tape = self.tape_box.currentText()
+            owner, owner_part = box_filter(self.owner_box)
+            tape, tape_part = box_filter(self.tape_box)
             self.rows = db.search_files(
-                con,
-                self.keyword.text(),
-                None if owner in (ALL, "") else owner,
-                None if tape in (ALL, "") else tape,
-                LIMIT,
+                con, self.keyword.text(), owner, tape, LIMIT, owner_part=owner_part, tape_part=tape_part
             )
         except Exception as e:
             QMessageBox.warning(self, "查询", f"查询失败：\n{e}")

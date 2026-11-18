@@ -1,4 +1,4 @@
-"""Main window: four tabs (backup / search / records / settings)."""
+"""Main window: five tabs (backup / search / records / statistics / settings)."""
 
 from __future__ import annotations
 
@@ -16,9 +16,10 @@ from .ui_backup import BackupPage
 from .ui_records import RecordsPage
 from .ui_search import SearchPage
 from .ui_settings import SettingsDialog, SettingsPage
+from .ui_stats import StatsPage
 from .ui_style import apply_theme
 
-APP_TITLE = "磁带备份 TapeBackup"
+APP_TITLE = "磁带备份"
 
 
 class MainWindow(QMainWindow):
@@ -31,6 +32,7 @@ class MainWindow(QMainWindow):
         self.backup_page = BackupPage(cfg)
         self.search_page = SearchPage(cfg)
         self.records_page = RecordsPage(cfg)
+        self.stats_page = StatsPage(cfg)
         self.settings_page = SettingsPage(cfg)
 
         self.tabs = QTabWidget()
@@ -38,6 +40,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.backup_page, "备份")
         self.tabs.addTab(self.search_page, "查询")
         self.tabs.addTab(self.records_page, "记录")
+        self.tabs.addTab(self.stats_page, "统计")
         self.tabs.addTab(self.settings_page, "设置")
         self.setCentralWidget(self.tabs)
 
@@ -51,7 +54,7 @@ class MainWindow(QMainWindow):
     def _tab_changed(self, index: int) -> None:
         page = self.tabs.widget(index)
         if page is not self.backup_page:
-            page.refresh()  # type: ignore[attr-defined]
+            page.refresh()  # type: ignore[attr-defined] 
 
     def _busy_changed(self, busy: bool) -> None:
         # Paths must not change under a running backup.
@@ -59,7 +62,7 @@ class MainWindow(QMainWindow):
         self.tabs.setTabToolTip(self.tabs.indexOf(self.settings_page), "备份进行中，不能修改设置" if busy else "")
 
     def _settings_saved(self) -> None:
-        for page in (self.backup_page, self.search_page, self.records_page):
+        for page in (self.backup_page, self.search_page, self.records_page, self.stats_page):
             page.refresh()
 
     def _set_title_progress(self, text: str) -> None:

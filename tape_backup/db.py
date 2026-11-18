@@ -235,6 +235,22 @@ def failed_files(con: sqlite3.Connection, job_id: int) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def owner_usage(con: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Tape space per name, all backups and all tapes together (old CSV records included), largest first.
+
+    Columns: owner, bytes, tapes (comma separated), tape_count, backups. Counted from archived batches,
+    the same figures the tape list adds up, so the per-name totals add up to the per-tape totals.
+    """
+    return con.execute(
+        "SELECT MIN(j.owner) AS owner, SUM(b.bytes) AS bytes, "
+        " GROUP_CONCAT(DISTINCT b.tape_id) AS tapes, COUNT(DISTINCT b.tape_id) AS tape_count, "
+        " COUNT(DISTINCT j.id) AS backups "
+        "FROM batches b JOIN jobs j ON j.id=b.job_id "
+        "WHERE b.status='ARCHIVED' AND b.tape_id IS NOT NULL "  # same rows as list_tapes
+        "GROUP BY j.owner COLLATE NOCASE ORDER BY bytes DESC, owner COLLATE NOCASE"
+    ).fetchall()
+
+
 # ---------------------------------------------------------------- search
 
 SEARCH_COLUMNS = (
@@ -243,26 +259,42 @@ SEARCH_COLUMNS = (
 )
 
 
+def _like(text: str) -> str:
+    """A LIKE pattern matching any value that contains text (wildcards in text match literally)."""
+    return "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
 def search_files(
     con: sqlite3.Connection,
     keyword: str = "",
     owner: str | None = None,
     tape_id: str | None = None,
     limit: int = 2000,
+    *,
+    owner_part: str | None = None,
+    tape_part: str | None = None,
 ) -> list[sqlite3.Row]:
-    """Files on tape whose path contains every space-separated word of `keyword`."""
+    """Files on tape whose path contains every space-separated word of `keyword`.
+
+    owner / tape_id match a whole name; owner_part / tape_part match any name containing the text.
+    """
     where = ["f.status='ARCHIVED'"]
     args: list = []
     for word in keyword.split():
-        escaped = word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         where.append("f.rel_path LIKE ? ESCAPE '\\'")
-        args.append(f"%{escaped}%")
+        args.append(_like(word))
     if owner:
         where.append("j.owner=? COLLATE NOCASE")
         args.append(owner)
+    if owner_part:
+        where.append("j.owner LIKE ? ESCAPE '\\'")
+        args.append(_like(owner_part))
     if tape_id:
         where.append("f.tape_id=?")
         args.append(tape_id)
+    if tape_part:
+        where.append("f.tape_id LIKE ? ESCAPE '\\'")
+        args.append(_like(tape_part))
     args.append(limit)
     return con.execute(
         f"SELECT {SEARCH_COLUMNS} FROM files f "
