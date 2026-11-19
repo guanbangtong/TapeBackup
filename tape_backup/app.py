@@ -1,4 +1,4 @@
-"""Main window: six tabs (backup / search / restore / records / statistics / settings)."""
+"""Main window: six tabs (backup / search / restore / records / statistics (tape + NAS) / settings)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from .ui_records import RecordsPage
 from .ui_restore_page import RestorePage
 from .ui_search import SearchPage
 from .ui_settings import SettingsDialog, SettingsPage
-from .ui_stats import StatsPage
+from .ui_nas import StatsTabs
 from .ui_style import apply_theme
 
 APP_TITLE = "磁带备份"
@@ -34,7 +34,7 @@ class MainWindow(QMainWindow):
         self.search_page = SearchPage(cfg)
         self.restore_page = RestorePage(cfg)
         self.records_page = RecordsPage(cfg)
-        self.stats_page = StatsPage(cfg)
+        self.stats_page = StatsTabs(cfg)  # tape usage + NAS usage
         self.settings_page = SettingsPage(cfg)
 
         self.tabs = QTabWidget()

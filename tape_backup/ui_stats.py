@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import Callable, Mapping
 
-from PySide6.QtCore import QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QMouseEvent, QPainter, QPainterPath, QPaintEvent
+from PySide6.QtCore import QPoint, QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QMouseEvent, QPainter, QPainterPath, QPaintEvent, QRegion
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -37,6 +38,46 @@ def tapes_text(row: sqlite3.Row) -> str:
     return ", ".join(sorted((row["tapes"] or "").split(","))) if row["tapes"] else ""
 
 
+def tape_detail(row: Mapping) -> str:
+    return f"磁带：{tapes_text(row)}\n共 {row['backups']} 次备份"
+
+
+def chart_image(rows: list[Mapping], total: int, title: str, subtitle: str, footnote: str = "") -> QImage:
+    """The bar chart on a white page with a title, at twice screen resolution, for saving as PNG."""
+    width, margin, scale = 1100, 40, 2
+    chart = UsageChart(detail=lambda r: "")
+    chart.set_rows(rows, total)
+    chart.resize(width - 2 * margin, chart.sizeHint().height())
+    title_font = QFont(UI_FONT, 16, QFont.Bold)
+    note_font = QFont(UI_FONT, 10)
+    head = 2 * margin + 30
+    foot = 40 if footnote else 16
+    height = head + chart.height() + foot
+
+    image = QImage(width * scale, height * scale, QImage.Format_ARGB32)
+    image.setDevicePixelRatio(scale)
+    image.fill(QColor(SURFACE))
+    p = QPainter(image)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.TextAntialiasing)
+    p.setPen(QColor(TEXT))
+    p.setFont(title_font)
+    p.drawText(QRectF(margin, margin - 8, width - 2 * margin, 32), Qt.AlignLeft | Qt.AlignVCenter, title)
+    p.setPen(QColor(MUTED))
+    p.setFont(note_font)
+    p.drawText(QRectF(margin, margin + 26, width - 2 * margin, 22), Qt.AlignLeft | Qt.AlignVCenter, subtitle)
+    p.end()
+    # Only the chart's own painting: the default also fills in the window's grey background.
+    chart.render(image, QPoint(margin, head), QRegion(), QWidget.RenderFlag.DrawChildren)
+    if footnote:
+        p = QPainter(image)
+        p.setPen(QColor(MUTED))
+        p.setFont(note_font)
+        p.drawText(QRectF(margin, head + chart.height() + 8, width - 2 * margin, 24), Qt.AlignLeft | Qt.AlignVCenter, footnote)
+        p.end()
+    return image
+
+
 class UsageChart(QWidget):
     """Horizontal bars, one per name, largest first; the value is written at the end of each bar.
 
@@ -49,19 +90,21 @@ class UsageChart(QWidget):
     NAME_MAX = 180  # longest name column before names are shortened with "…"
     VALUE_SPACE = 150  # room right of the longest bar for its label
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, detail: Callable[[Mapping], str] | None = None) -> None:
         super().__init__(parent)
         self.setMouseTracking(True)
-        self.rows: list[sqlite3.Row] = []
+        self.rows: list[Mapping] = []  # each needs "owner" (the name) and "bytes"
         self.total = 0
         self.hover = -1
+        self.detail = detail or tape_detail  # extra tooltip lines for one row
         self.value_font = QFont(NUMBER_FONT)
         self.value_font.setPointSize(10)
         self.name_font = QFont(UI_FONT, 10)
 
-    def set_rows(self, rows: list[sqlite3.Row]) -> None:
+    def set_rows(self, rows: list[Mapping], total: int | None = None) -> None:
+        """total: what shares are a part of; defaults to the sum of the rows shown."""
         self.rows = rows
-        self.total = sum(r["bytes"] or 0 for r in rows)
+        self.total = sum(r["bytes"] or 0 for r in rows) if total is None else total
         self.hover = -1
         self.setFixedHeight(self.sizeHint().height())
         self.update()
@@ -139,7 +182,7 @@ class UsageChart(QWidget):
             QToolTip.showText(
                 event.globalPosition().toPoint(),
                 f"{r['owner']}\n{format_bytes(r['bytes'] or 0)}，占全部的 {share_text(r['bytes'] or 0, self.total)}\n"
-                f"磁带：{tapes_text(r)}\n共 {r['backups']} 次备份",
+                + self.detail(r),
                 self,
             )
 
