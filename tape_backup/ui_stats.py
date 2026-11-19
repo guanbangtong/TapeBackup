@@ -115,7 +115,7 @@ class UsageChart(QWidget):
     def _name_width(self) -> int:
         fm = QFontMetrics(self.name_font)
         widest = max((fm.horizontalAdvance(r["owner"]) for r in self.rows), default=0)
-        return min(widest, self.NAME_MAX)
+        return min(widest + 4, self.NAME_MAX)  # + 4: an exact fit gets elided ("ZhangS…") through rounding
 
     def _row_at(self, y: float) -> int:
         i = int((y - self.PAD) // self.ROW)
