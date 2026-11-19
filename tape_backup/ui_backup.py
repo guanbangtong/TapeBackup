@@ -467,18 +467,15 @@ class BackupPage(QWidget):
         jobs = list(self._jobs.values())
         deleting = sum(1 for job in jobs if job["delete_source"])
         if not jobs:
-            title, text = "还没有要备份的文件夹", "点左边的“添加文件夹…”，选择 NAS 上要备份的文件夹。"
+            title = "没有待备份的文件夹"
         elif any(job["status"] in ("RUNNING", "DONE") for job in jobs):
-            title, text = "有未完成的任务", "点“开始备份”，会从上次中断的地方继续。"
+            title = "有未完成的任务"
         else:
             title = f"{len(jobs)} 个文件夹等待备份"
-            text = "确认磁带号，然后点“开始备份”。过程中可以随时停止，下次会接着做。"
         self.idle_title.setText(title)
-        self.idle_text.setText(text)
-        self.queue_hint.setText(
-            f"{deleting} 个文件夹备份后会删除 NAS 源数据：只删已在磁带上的文件，删除前等待 "
-            f"{self.cfg.delete_delay_minutes:g} 分钟并在磁带上重新核对。" if deleting else ""
-        )
+        self.idle_text.setText("")
+        self.idle_text.setVisible(False)
+        self.queue_hint.setText(f"{deleting} 个文件夹备份后删除源数据" if deleting else "")
         self.queue_hint.setVisible(bool(deleting))
 
     @staticmethod
