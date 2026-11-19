@@ -203,8 +203,6 @@ class StatsPage(QWidget):
         self.status = label("", "hint")
         top = QHBoxLayout()
         top.setSpacing(8)
-        top.addWidget(label("每人占用的磁带空间", "title"))
-        top.addSpacing(4)
         top.addWidget(self.status)
         top.addStretch(1)
 
@@ -224,7 +222,6 @@ class StatsPage(QWidget):
         self.empty_label.setAlignment(Qt.AlignCenter)
 
         chart_card, chart_layout = card(margins=12)
-        chart_layout.addWidget(label("同一个名称在不同磁带、不同次备份的数据已合并；包括导入的旧记录。", "hint"))
         chart_layout.addWidget(scroll, 1)
         chart_layout.addWidget(self.empty_label, 1)
 

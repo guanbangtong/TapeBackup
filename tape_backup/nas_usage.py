@@ -19,11 +19,12 @@ Each person counts the folders still to list; at 0 that person is done.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from .copier import long_path
 
@@ -60,6 +61,29 @@ class FolderUsage:
     bytes: int = 0
     files: int = 0
     errors: int = 0  # files or folders that could not be read (skipped)
+
+
+RESULT_FILE = "nas_usage.json"  # last complete result, in the data folder next to the database
+
+
+def save_result(path: str, root: str, measured_at: str, seconds: float, done: list[FolderUsage]) -> None:
+    """Keep a complete result so the next start of the program shows it without measuring again."""
+    data = {"root": root, "measured_at": measured_at, "seconds": seconds, "folders": [asdict(u) for u in done]}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)  # never leaves a half-written file
+
+
+def load_result(path: str) -> dict | None:
+    """The saved result with folders as FolderUsage, or None if there is none (or it cannot be read)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        data["folders"] = [FolderUsage(**u) for u in data["folders"]]
+        return data
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 class NasScan:

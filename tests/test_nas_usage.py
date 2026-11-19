@@ -133,5 +133,35 @@ def test_page_charts_only_big_folders_and_exports_png(nas, tmp_path, qapp, monke
 
     out = tmp_path / "chart.png"
     assert page.export_png(str(out))
-    assert out.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n" and out.stat().st_size > 5000
+    from PySide6.QtGui import QImage
+    image = QImage(str(out))
+    assert out.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    assert image.width() == 2200 and image.height() > 300  # 1100 px page at twice the resolution
     page.close()
+
+
+def run_page(page, qapp) -> None:
+    page.start()
+    deadline = time.monotonic() + 10
+    while (page.is_running() or page.timer.isActive()) and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+
+
+def test_last_result_is_shown_again_until_measured_anew(nas, tmp_path, qapp):
+    cfg = Config(staging_root=str(tmp_path / "s"), tape_root=str(tmp_path / "t"), data_dir=str(tmp_path / "data"))
+    first = ui_nas.NasPage(cfg)
+    assert first.rows == []  # nothing measured yet
+    first.path_edit.setText(str(nas))
+    run_page(first, qapp)
+    measured = list(first.rows)
+    first.close()
+
+    again = ui_nas.NasPage(cfg)  # the program started again: no new scan, same picture
+    assert again.rows == measured and again.table.rowCount() == 3
+    assert again.path_edit.text() == str(nas)
+
+    again.path_edit.setText(str(tmp_path / "not_connected"))
+    run_page(again, qapp)  # a scan that fails keeps the last result
+    assert again.rows == measured and "找不到" in again.status.text()
+    again.close()

@@ -6,6 +6,7 @@ chart (the table lists them all). Measuring runs in a worker thread (NasScan); a
 
 from __future__ import annotations
 
+import os
 import threading
 from datetime import datetime
 
@@ -27,14 +28,14 @@ from PySide6.QtWidgets import (
 
 from .config import Config
 from .copier import format_bytes
-from .nas_usage import FolderUsage, NasScan, normalize_root
+from .nas_usage import RESULT_FILE, FolderUsage, NasScan, load_result, normalize_root, save_result
 from .ui_records import NumItem, make_table
 from .ui_stats import StatsPage, UsageChart, chart_image, share_text
 from .ui_style import SURFACE, bulk_update, card, label, page_margins, set_prop
 
 TB = 1024 ** 4
 CHART_MIN_BYTES = 1 * TB  # smaller folders are left out of the chart
-TITLE = "NAS 各文件夹占用空间"
+TITLE = "NAS 占用"
 
 
 def files_detail(row) -> str:
@@ -60,7 +61,7 @@ class NasPage(QWidget):
         self.rows: list[dict] = []  # all finished folders, largest first
 
         self.path_edit = QLineEdit()
-        self.path_edit.setPlaceholderText("NAS 盘符或路径，例如 Z:")
+        self.path_edit.setPlaceholderText("例如 Z:")
         self.path_edit.setMaximumWidth(260)
         self.browse_button = QPushButton("浏览…")
         self.start_button = QPushButton("开始统计")
@@ -71,8 +72,6 @@ class NasPage(QWidget):
         self.export_button.setEnabled(False)
         top = QHBoxLayout()
         top.setSpacing(8)
-        top.addWidget(label(TITLE, "title"))
-        top.addSpacing(12)
         top.addWidget(label("位置", "hint"))
         top.addWidget(self.path_edit)
         top.addWidget(self.browse_button)
@@ -81,7 +80,7 @@ class NasPage(QWidget):
         top.addStretch(1)
         top.addWidget(self.export_button)
 
-        self.status = label("输入 NAS 的盘符后点“开始统计”。只读取文件大小，不会改动 NAS 上的任何东西。", "hint")
+        self.status = label("", "hint")
         self.status.setWordWrap(True)
 
         self.chart = UsageChart(detail=files_detail)
@@ -96,9 +95,7 @@ class NasPage(QWidget):
         holder_layout.addWidget(self.chart)
         holder_layout.addStretch(1)
         scroll.setWidget(holder)
-        self.chart_hint = label("", "hint")
         chart_card, chart_layout = card(margins=12)
-        chart_layout.addWidget(self.chart_hint)
         chart_layout.addWidget(scroll, 1)
 
         self.table = make_table(["名称", "大小", "文件数"])
@@ -135,7 +132,8 @@ class NasPage(QWidget):
         self.path_edit.returnPressed.connect(self.start)
         self.stop_button.clicked.connect(self._stop)
         self.export_button.clicked.connect(lambda: self.export_png())
-        self._show([])
+        if not self._load_saved():
+            self._show([])
 
     # ------------------------------------------------------------ running
 
@@ -188,10 +186,9 @@ class NasPage(QWidget):
             self.shown = len(snap["done"])
             self._show(snap["done"])
         if self.is_running():
-            now = "，正在统计：" + "、".join(snap["running"][:4]) if snap["running"] else ""
             self.status.setText(
-                f"已完成 {len(snap['done'])} / {snap['folders'] or '?'} 个文件夹，已扫描 {snap['files']:,} 个文件"
-                f"（{format_bytes(snap['bytes'])}），用时 {duration_text(snap['seconds'])}{now}"
+                f"{len(snap['done'])} / {snap['folders'] or '?'}    {snap['files']:,} 个文件    "
+                f"{format_bytes(snap['bytes'])}    {duration_text(snap['seconds'])}"
             )
             return
         self.timer.stop()
@@ -200,20 +197,41 @@ class NasPage(QWidget):
         self._set_running(False)
         errors = sum(u.errors for u in snap["done"])
         if result == "error":
+            self._load_saved()  # the scan never started: keep showing the last result
             self.status.setText(message)
             set_prop(self.status, "status", "fail")
             return
         set_prop(self.status, "status", "ok" if result == "done" else "warn")
         total = sum(r["bytes"] for r in self.rows)
-        text = message or (
-            f"{self.root}：{len(self.rows)} 个文件夹，共 {format_bytes(total)}，统计于 {self.measured_at}，"
-            f"用时 {duration_text(snap['seconds'])}。"
-        )
+        text = message or f"共 {format_bytes(total)}，{len(self.rows)} 个文件夹，用时 {duration_text(snap['seconds'])}"
         if result == "stopped":
-            text = f"已停止：只统计完 {len(self.rows)} / {snap['folders']} 个文件夹，下面只是这一部分。"
+            text = f"已停止（{len(self.rows)} / {snap['folders']}）"  # partial: not saved, the last full result stays
         if errors:
-            text += f" 有 {errors:,} 个文件或文件夹无法读取，已跳过。"
+            text += f"，{errors:,} 项无法读取"
+        if result == "done":
+            try:
+                os.makedirs(self.cfg.data_dir, exist_ok=True)
+                save_result(self._result_path(), self.root, self.measured_at, snap["seconds"], snap["done"])
+            except OSError as e:
+                text += f"（结果未能保存：{e}）"
         self.status.setText(text)
+
+    def _result_path(self) -> str:
+        return os.path.join(self.cfg.data_dir, RESULT_FILE)
+
+    def _load_saved(self) -> bool:
+        """Show the last complete result, if there is one."""
+        data = load_result(self._result_path())
+        if data is None:
+            return False
+        self.root, self.measured_at = data["root"], data["measured_at"]
+        self.path_edit.setText(self.root)
+        self._show(data["folders"])
+        self.export_button.setEnabled(bool(self.rows))
+        total = sum(r["bytes"] for r in self.rows)
+        self.status.setText(f"共 {format_bytes(total)}，{len(self.rows)} 个文件夹，统计于 {self.measured_at}")
+        set_prop(self.status, "status", None)
+        return True
 
     # ------------------------------------------------------------ showing
 
@@ -222,17 +240,7 @@ class NasPage(QWidget):
                            key=lambda r: (-r["bytes"], r["owner"].lower()))
         total = sum(r["bytes"] for r in self.rows)
         big = [r for r in self.rows if r["bytes"] >= CHART_MIN_BYTES]
-        self.chart.set_rows(big, total)
-        small = len(self.rows) - len(big)
-        if not self.rows:
-            self.chart_hint.setText("还没有统计结果")
-        elif not big:
-            self.chart_hint.setText(f"没有 1 TB 及以上的文件夹；{small} 个较小的文件夹见右侧表格。")
-        else:
-            self.chart_hint.setText(
-                f"只画 1 TB 及以上的 {len(big)} 个文件夹" + (f"；另有 {small} 个小于 1 TB，见右侧表格。" if small else "。")
-                + "占比按全部文件夹合计。"
-            )
+        self.chart.set_rows(big, total)  # under 1 TB: table only; shares are of all folders
 
         t = self.table
         with bulk_update(t):
@@ -251,7 +259,7 @@ class NasPage(QWidget):
     def export_png(self, path: str | None = None) -> bool:
         big = self.chart_rows()
         if not big:
-            QMessageBox.information(self, TITLE, "没有 1 TB 及以上的文件夹，没有可导出的图。")
+            QMessageBox.information(self, TITLE, "没有可导出的数据。")
             return False
         if path is None:
             name = f"NAS空间占用_{self.measured_at[:10]}.png"
@@ -259,13 +267,7 @@ class NasPage(QWidget):
             if not path:
                 return False
         total = sum(r["bytes"] for r in self.rows)
-        small = len(self.rows) - len(big)
-        image = chart_image(
-            big, total, TITLE,
-            f"{self.root}    统计于 {self.measured_at}    全部 {len(self.rows)} 个文件夹，共 {format_bytes(total)}",
-            f"只列出 1 TB 及以上的 {len(big)} 个文件夹" + (f"，另有 {small} 个小于 1 TB 未列出" if small else "")
-            + "；百分比为占全部文件夹合计的比例。",
-        )
+        image = chart_image(big, total, TITLE, f"{self.root}    {self.measured_at}    共 {format_bytes(total)}")
         if not image.save(path, "PNG"):
             QMessageBox.warning(self, TITLE, f"无法保存图片：{path}")
             return False

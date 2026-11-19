@@ -27,8 +27,7 @@ from .ui_search import ALL, filter_box
 from .ui_style import label, page_margins
 
 HEADERS = ["文件夹", "大小", "文件数", "磁带"]
-PICK_NAME = "先选择一个名称"
-NOTE = "文件会先从磁带读到中转盘，再送到“目标文件夹\\备份的文件夹名\\原路径”下，同名文件会被覆盖。"
+PICK_NAME = ""
 
 
 class Folder:
@@ -110,8 +109,6 @@ class RestorePage(QWidget):
         self.owner_box.lineEdit().setPlaceholderText("选择或输入名称")
         top = QHBoxLayout()
         top.setSpacing(8)
-        top.addWidget(label("从磁带取回文件夹", "title"))
-        top.addSpacing(12)
         top.addWidget(label("名称", "hint"))
         top.addWidget(self.owner_box)
         top.addStretch(1)
@@ -138,7 +135,6 @@ class RestorePage(QWidget):
         layout = QVBoxLayout(self)
         page_margins(layout)
         layout.addLayout(top)
-        layout.addWidget(label("勾选要取回的文件夹，会包括它下面的所有文件。只列出有文件清单的备份，导入的旧记录不在这里。", "hint"))
         layout.addWidget(self.tree, 1)
         layout.addLayout(bottom)
 
@@ -214,7 +210,7 @@ class RestorePage(QWidget):
         for col in (1, 2, 3):
             self.tree.resizeColumnToContents(col)
         if not roots:
-            self.summary.setText(f"{owner} 没有可按文件夹取回的备份（只有旧记录，或还没有备份完成）。")
+            self.summary.setText("没有可取回的文件夹")
             self.restore_button.setEnabled(False)
         else:
             self._update_summary()
@@ -258,7 +254,7 @@ class RestorePage(QWidget):
         if not self.owner:
             return
         if not folders:
-            self.summary.setText("勾选要取回的文件夹")
+            self.summary.setText("")
             self.restore_button.setEnabled(False)
             return
         size = sum(f.size for f in folders)
@@ -273,4 +269,4 @@ class RestorePage(QWidget):
             return
         from .ui_restore import RestoreDialog
 
-        RestoreDialog(self.cfg, files, self, note=NOTE).exec()
+        RestoreDialog(self.cfg, files, self).exec()

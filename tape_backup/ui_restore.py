@@ -38,7 +38,7 @@ class RestoreDialog(QDialog):
     tape_requested = Signal(str, str)      # tape id, reason
     run_finished = Signal(str, str)        # result, message
 
-    def __init__(self, cfg: Config, files: list, parent: QWidget | None = None, *, note: str | None = None) -> None:
+    def __init__(self, cfg: Config, files: list, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.cfg = cfg
         self.files = list(files)
@@ -67,8 +67,6 @@ class RestoreDialog(QDialog):
         dest_row.addWidget(label("取回到"))
         dest_row.addWidget(self.dest_edit, 1)
         dest_row.addWidget(self.browse_button)
-        note_label = label(note or "文件会先从磁带读到中转盘，再送到“目标文件夹\\名称\\原路径”下，同名文件会被覆盖。", "hint")
-        note_label.setWordWrap(True)
 
         self.start_button = QPushButton("开始取回")
         set_prop(self.start_button, "primary", True)
@@ -105,7 +103,6 @@ class RestoreDialog(QDialog):
         layout.addWidget(tape_label)
         layout.addSpacing(4)
         layout.addLayout(dest_row)
-        layout.addWidget(note_label)
         layout.addLayout(buttons)
         layout.addSpacing(4)
         layout.addWidget(self.bar)
