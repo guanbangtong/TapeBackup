@@ -6,6 +6,7 @@ import csv
 import os
 from pathlib import Path
 import sys
+import time
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
@@ -452,6 +453,45 @@ def test_search_page_refresh_preserves_both_unlisted_inputs(cfg, con, make_page,
     assert page.tape_box.findText("T99") >= 0
     assert page.owner_box.findText("unlisted owner fragment") == -1
     assert page.tape_box.findText("unlisted tape fragment") == -1
+
+
+def wait_until(qapp, condition, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    return condition()
+
+
+def test_search_page_searches_while_typing(cfg, make_page, qapp, search_catalogue):
+    page = make_page(ui_search.SearchPage, cfg)
+    page.keyword.setText("needle")
+    page.owner_box.setEditText("Li")  # no button, no Enter
+
+    assert wait_until(qapp, lambda: len(page.rows) == 6)
+    assert {row["id"] for row in page.rows} == {
+        search_catalogue[owner, tape] for owner in ("LiHua", "LiMing") for tape in ("T10", "T11", "X10")
+    }
+    assert page.table.rowCount() == 6
+
+    page.keyword.setText("")
+    page.owner_box.setEditText("")
+    assert wait_until(qapp, lambda: page.empty_label.isVisible())
+    assert page.rows == [] and page.empty_label.text() == ui_search.EMPTY_BEFORE
+
+
+def test_search_page_drops_late_result_of_older_search(cfg, make_page, qapp, search_catalogue):
+    page = make_page(ui_search.SearchPage, cfg)
+    page.keyword.setText("needle_T10")
+    page.search_button.click()
+    shown = [row["id"] for row in page.rows]
+    assert len(shown) == 3
+
+    page.found.emit(page.generation - 1, [], "")  # an older search finishing after the newer one
+    qapp.processEvents()
+
+    assert [row["id"] for row in page.rows] == shown
+    assert page.table.rowCount() == 3
 
 
 def test_stats_page_refresh_counts_names_and_percentages(cfg, con, make_page):

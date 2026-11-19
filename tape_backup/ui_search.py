@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import csv
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QCompleter,
@@ -27,6 +29,7 @@ from .copier import format_bytes
 from .ui_style import bulk_update, label, page_margins, setup_table
 
 LIMIT = 2000
+TYPING_PAUSE_MS = 300  # search this long after the last keystroke
 ALL = "全部"
 HEADERS = ["文件", "大小", "名称", "磁带号", "备份时间", "存放方式"]
 EMPTY_BEFORE = "输入关键字查找文件在哪盘磁带上"
@@ -79,6 +82,9 @@ def box_filter(box: QComboBox) -> tuple[str | None, str | None]:
 
 
 class SearchPage(QWidget):
+    # (search number, rows, error) sent from the background thread, handled in the window's thread
+    found = Signal(int, object, str)
+
     def __init__(self, cfg: Config, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("page")
@@ -86,6 +92,11 @@ class SearchPage(QWidget):
         self.con: sqlite3.Connection | None = None
         self.db_path = ""
         self.rows: list[sqlite3.Row] = []  # current results, in query order
+        self.generation = 0  # number of the newest search; results of older ones are dropped
+        self.pool = ThreadPoolExecutor(max_workers=1)  # one query at a time, off the window thread
+        self.typing_timer = QTimer(self)
+        self.typing_timer.setSingleShot(True)
+        self.typing_timer.setInterval(TYPING_PAUSE_MS)
 
         self.keyword = QLineEdit()
         self.keyword.setPlaceholderText("输入文件名或路径中的关键字，多个词用空格隔开")
@@ -147,6 +158,12 @@ class SearchPage(QWidget):
         self.export_button.clicked.connect(lambda: self.export_csv())
         self.restore_button.clicked.connect(self.restore)
         self.table.itemSelectionChanged.connect(self._selection_changed)
+        # Search as you type: every edit restarts the timer, so the query runs once typing pauses.
+        self.keyword.textChanged.connect(self.typing_timer.start)
+        self.owner_box.currentTextChanged.connect(self.typing_timer.start)
+        self.tape_box.currentTextChanged.connect(self.typing_timer.start)
+        self.typing_timer.timeout.connect(self.search_in_background)
+        self.found.connect(self._found, Qt.QueuedConnection)
 
         self.refresh()
 
@@ -170,6 +187,7 @@ class SearchPage(QWidget):
             self.status.setText(f"无法读取记录数据库：{e}")
             return
         for box, items in ((self.owner_box, owners), (self.tape_box, sorted(tapes))):
+            blocker = QSignalBlocker(box)  # reloading the list is not typing; don't start a search
             current = box.currentText()
             box.clear()
             box.addItems([ALL] + items)
@@ -178,18 +196,64 @@ class SearchPage(QWidget):
                 box.setCurrentIndex(index)
             else:
                 box.setEditText(current)  # keep what was typed, even if no name matches it exactly
+            blocker.unblock()
+
+    def _query(self) -> tuple:
+        """Arguments for db.search_files from what the boxes hold: (keyword, owner, tape, limit, parts)."""
+        owner, owner_part = box_filter(self.owner_box)
+        tape, tape_part = box_filter(self.tape_box)
+        return self.keyword.text(), owner, tape, LIMIT, {"owner_part": owner_part, "tape_part": tape_part}
+
+    def _nothing_typed(self) -> bool:
+        return not self.keyword.text().strip() and box_filter(self.owner_box) == box_filter(self.tape_box) == (None, None)
 
     def search(self) -> None:
+        """Search now (button / Enter), in the window thread."""
+        self.typing_timer.stop()
+        self.generation += 1  # a background search still running is now out of date
         try:
-            con = self._connect()
-            owner, owner_part = box_filter(self.owner_box)
-            tape, tape_part = box_filter(self.tape_box)
-            self.rows = db.search_files(
-                con, self.keyword.text(), owner, tape, LIMIT, owner_part=owner_part, tape_part=tape_part
-            )
+            keyword, owner, tape, limit, parts = self._query()
+            self.rows = db.search_files(self._connect(), keyword, owner, tape, limit, **parts)
         except Exception as e:
             QMessageBox.warning(self, "查询", f"查询失败：\n{e}")
             return
+        self._fill()
+
+    def search_in_background(self) -> None:
+        """Search once typing pauses. The query runs in another thread, so typing never stalls."""
+        self.generation += 1
+        if self._nothing_typed():  # boxes cleared: back to the start message
+            self.rows = []
+            self.table.setRowCount(0)
+            self.status.setText("")
+            self._selection_changed()
+            self._show_empty(EMPTY_BEFORE)
+            return
+        self.status.setText("正在查找…")
+        self.pool.submit(self._run_query, self.generation, self.cfg.db_path, self._query())
+
+    def _run_query(self, generation: int, db_path: str, query: tuple) -> None:
+        """Runs in the background thread, with its own database connection (one per thread)."""
+        if generation != self.generation:
+            return  # newer text was typed while this search waited its turn; skip it
+        keyword, owner, tape, limit, parts = query
+        try:
+            with closing(db.connect(db_path)) as con:
+                rows, error = db.search_files(con, keyword, owner, tape, limit, **parts), ""
+        except Exception as e:
+            rows, error = [], str(e)
+        try:
+            self.found.emit(generation, rows, error)
+        except RuntimeError:
+            pass  # the window was closed meanwhile
+
+    def _found(self, generation: int, rows: list, error: str) -> None:
+        if generation != self.generation:
+            return  # an older search finished late; only the newest one fills the table
+        if error:
+            self.status.setText(f"查询失败：{error}")
+            return
+        self.rows = rows
         self._fill()
 
     def _show_empty(self, text: str | None) -> None:
