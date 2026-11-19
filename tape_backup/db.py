@@ -304,6 +304,50 @@ def search_files(
     ).fetchall()
 
 
+def owner_files(con: sqlite3.Connection, owner: str) -> list[tuple]:
+    """(id, source_path, rel_path, size, tape_id) of every archived file of one name, all backups.
+
+    Only what the folder tree needs; plain tuples, unsorted (200,000 files load in a fraction of a second).
+    """
+    cur = con.execute(
+        "SELECT f.id, j.source_path, f.rel_path, f.size, f.tape_id FROM files f JOIN jobs j ON j.id=f.job_id "
+        "WHERE j.owner=? COLLATE NOCASE AND f.status='ARCHIVED'",
+        (owner,),
+    )
+    cur.row_factory = None
+    return cur.fetchall()
+
+
+def owner_files_mark(con: sqlite3.Connection, owner: str) -> tuple:
+    """Changes whenever a file of this name is archived or removed: tells whether a loaded tree is stale."""
+    return tuple(con.execute(
+        "SELECT COUNT(*), MAX(f.id) FROM files f JOIN jobs j ON j.id=f.job_id "
+        "WHERE j.owner=? COLLATE NOCASE AND f.status='ARCHIVED'",
+        (owner,),
+    ).fetchone())
+
+
+def files_by_id(con: sqlite3.Connection, ids: list[int]) -> list[sqlite3.Row]:
+    """Full rows (search_files columns plus source_path) of the given archived files."""
+    rows: list[sqlite3.Row] = []
+    for i in range(0, len(ids), 500):  # stay below SQLite's limit on query parameters
+        chunk = ids[i:i + 500]
+        rows += con.execute(
+            f"SELECT {SEARCH_COLUMNS}, j.source_path FROM files f "
+            "JOIN jobs j ON j.id=f.job_id JOIN batches b ON b.id=f.batch_id "
+            f"WHERE f.status='ARCHIVED' AND f.id IN ({','.join('?' * len(chunk))})",
+            chunk,
+        ).fetchall()
+    return rows
+
+
+def sources_to_delete(con: sqlite3.Connection) -> list[str]:
+    """Source folders that the program will still delete ("delete after backup" ticked, not deleted yet)."""
+    return [r[0] for r in con.execute(
+        "SELECT source_path FROM jobs WHERE delete_source=1 AND source_deleted_at IS NULL AND legacy=0"
+    )]
+
+
 def files_of_job(con: sqlite3.Connection, job_id: int) -> list[sqlite3.Row]:
     """All archived files of one job (same columns as search_files), e.g. to restore a whole backup."""
     return con.execute(

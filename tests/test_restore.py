@@ -415,3 +415,74 @@ def test_stop_mid_file_leaves_no_partial_file(world, monkeypatch, name):
     assert r.run() == ("stopped", "")
     assert r.restored == 0
     assert dest_files(world.dest) == set()  # no file and no .part leftovers
+
+
+# ---------------------------------------------------------------- staging, folders, safety rules
+
+def test_restore_goes_through_staging_and_leaves_it_empty(world):
+    r, (result, message) = restore_all(world)
+    assert result == "done", message
+    assert dest_files(world.dest) == {f"{OWNER}/{rel}" for rel in SAMPLE}
+    assert not os.path.exists(r.staging_dir)  # the staging copies are gone once delivered
+
+
+def test_folder_restore_lands_under_the_backed_up_folder_name(world):
+    from tape_backup.ui_restore_page import build_tree, restore_rows
+
+    con = db.connect(world.cfg.db_path)
+    try:
+        (root,) = build_tree(db.owner_files(con, OWNER.lower()))  # names match case-insensitively
+    finally:
+        con.close()
+    assert root.count == len(SAMPLE) and root.size == sum(len(d) for d in SAMPLE.values())
+    con = db.connect(world.cfg.db_path)
+    try:
+        files = restore_rows(con, [root.children["sub"]])  # tick the folder "sub"
+    finally:
+        con.close()
+
+    r = Restorer(world.rcfg, files, str(world.dest), ask_tape=no_ask)
+    assert r.run()[0] == "done"
+    assert dest_files(world.dest) == {"source/sub/deep/b.raw"}
+    assert (world.dest / "source" / "sub" / "deep" / "b.raw").read_bytes() == SAMPLE["sub/deep/b.raw"]
+
+
+def test_only_the_newest_backup_of_a_file_is_restored(world):
+    (row,) = rows_named(world, "a.raw")
+    older = dict(row, archived_at="2000-01-01 00:00:00", sha256="0" * 64)  # would fail its check if chosen
+    r = Restorer(world.rcfg, [older, row], str(world.dest), ask_tape=no_ask)
+    assert r.older_versions == 1
+    assert r.run()[0] == "done"
+    assert r.failures == [] and r.restored == 1
+    assert (world.dest / OWNER / "a.raw").read_bytes() == SAMPLE["a.raw"]
+
+
+def test_refuses_a_destination_inside_a_source_that_will_be_deleted(world, tmp_path):
+    nas = tmp_path / "nas" / OWNER
+    nas.mkdir(parents=True)
+    con = db.connect(world.cfg.db_path)
+    try:
+        db.add_job(con, OWNER, str(nas), delete_source=True)  # queued, "delete after backup" ticked
+    finally:
+        con.close()
+    r = Restorer(world.rcfg, world.rows, str(tmp_path / "nas"), ask_tape=no_ask)  # files would land in nas\LiHua
+    result, message = r.run()
+    assert result == "error" and "备份后删除" in message
+    assert dest_files(tmp_path / "nas") == set()
+
+
+def test_refuses_when_the_staging_disk_is_too_small(world, monkeypatch):
+    monkeypatch.setattr(restore.shutil, "disk_usage", lambda path: SimpleNamespace(free=10, total=10, used=0))
+    result, message = restore_all(world)[1]
+    assert result == "error" and "空间不够" in message
+    assert not world.dest.exists() or dest_files(world.dest) == set()
+
+
+def test_backup_and_restore_never_use_the_drive_at_the_same_time(world):
+    from tape_backup.engine import TAPE_DRIVE
+
+    with TAPE_DRIVE:  # as if a backup were running
+        result, message = restore_all(world)[1]
+        assert result == "error" and "正在备份" in message
+        assert Engine(world.cfg, ask_tape=lambda *a: None).run("TAPE01")[0] == "error"
+    assert restore_all(world)[1][0] == "done"  # free again afterwards

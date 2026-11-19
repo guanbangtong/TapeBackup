@@ -62,6 +62,8 @@ from .copier import (
 
 TAR_END_OVERHEAD = 2 * tarfile.RECORDSIZE  # end-of-archive blocks plus padding to a full record
 MAX_ATTEMPTS = 3
+# One tape drive: a backup and a restore must never use it at the same time.
+TAPE_DRIVE = threading.Lock()
 MTIME_TOLERANCE = 2.0  # seconds; file systems round modification times differently
 
 # "delete" (optional, per job): wait, then remove the NAS source. Its unit is "seconds" while waiting.
@@ -247,6 +249,14 @@ class Engine:
 
     def run(self, tape_id: str) -> tuple[str, str]:
         """Process every unfinished and queued job. Returns ('done'|'stopped'|'error', message)."""
+        if not TAPE_DRIVE.acquire(blocking=False):
+            return "error", "正在从磁带取回文件，磁带机被占用。请等取回完成后再开始备份。"
+        try:
+            return self._run(tape_id)
+        finally:
+            TAPE_DRIVE.release()
+
+    def _run(self, tape_id: str) -> tuple[str, str]:
         self.tape_id = normalize_tape_id(tape_id)
         self.progress.tape_id = self.tape_id
         try:

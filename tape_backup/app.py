@@ -1,4 +1,4 @@
-"""Main window: five tabs (backup / search / records / statistics / settings)."""
+"""Main window: six tabs (backup / search / restore / records / statistics / settings)."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from .config import Config
 from .icon import app_icon
 from .ui_backup import BackupPage
 from .ui_records import RecordsPage
+from .ui_restore_page import RestorePage
 from .ui_search import SearchPage
 from .ui_settings import SettingsDialog, SettingsPage
 from .ui_stats import StatsPage
@@ -31,6 +32,7 @@ class MainWindow(QMainWindow):
 
         self.backup_page = BackupPage(cfg)
         self.search_page = SearchPage(cfg)
+        self.restore_page = RestorePage(cfg)
         self.records_page = RecordsPage(cfg)
         self.stats_page = StatsPage(cfg)
         self.settings_page = SettingsPage(cfg)
@@ -39,6 +41,7 @@ class MainWindow(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.tabs.addTab(self.backup_page, "备份")
         self.tabs.addTab(self.search_page, "查询")
+        self.tabs.addTab(self.restore_page, "取回")
         self.tabs.addTab(self.records_page, "记录")
         self.tabs.addTab(self.stats_page, "统计")
         self.tabs.addTab(self.settings_page, "设置")
@@ -62,7 +65,7 @@ class MainWindow(QMainWindow):
         self.tabs.setTabToolTip(self.tabs.indexOf(self.settings_page), "备份进行中，不能修改设置" if busy else "")
 
     def _settings_saved(self) -> None:
-        for page in (self.backup_page, self.search_page, self.records_page, self.stats_page):
+        for page in (self.backup_page, self.search_page, self.restore_page, self.records_page, self.stats_page):
             page.refresh()
 
     def _set_title_progress(self, text: str) -> None:

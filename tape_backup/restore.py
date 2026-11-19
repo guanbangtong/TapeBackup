@@ -20,23 +20,45 @@ Tape is sequential: tapes are handled one at a time, each tar is read in one for
 files are read in path order (the order they were written). The tape is identified by the name of
 its marker file only, never by reading file contents.
 
+Two steps, like a backup in reverse: tape -> staging folder on the local disk (<staging>\\TapeRestore),
+then staging -> destination (usually a NAS folder). The tape is read in one go at full speed and never
+waits for the network. Each step checks the SHA-256 recorded at backup time.
+
 Files are written to "<name>.part" first and renamed when complete and verified, so the destination
-never holds a partial or corrupt file, and an existing file is only replaced by a good copy.
+never holds a partial or corrupt file; a file of the same name is replaced by the good copy.
+The staging folder is emptied at the start and at the end of every run (no resume: restores are small).
+
+Where a file goes: <dest>\\<row["restore_as"]> if the row has it, else <dest>\\<owner>\\<rel_path>.
+When several rows go to the same place (a file backed up again after it changed), the newest backup wins.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import tarfile
 import threading
 import traceback
+from contextlib import closing
 from datetime import datetime
 from typing import Callable, Iterable, Mapping
 
+from . import db
 from .config import Config
-from .copier import TAPE_CHUNK, CopyError, Stopped, copy_file, long_path, remove_quietly
-from .engine import normalize_tape_id, raw_media_path, read_tape_marker, tar_media_path, tar_member_name
+from .copier import TAPE_CHUNK, CopyError, HashMismatch, Stopped, copy_file, format_bytes, long_path, remove_quietly
+from .engine import (
+    TAPE_DRIVE,
+    _overlaps,
+    _real,
+    normalize_tape_id,
+    raw_media_path,
+    read_tape_marker,
+    tar_media_path,
+    tar_member_name,
+)
+
+RESTORE_DIR = "TapeRestore"  # staging sub-folder used only by restores
 
 PART_SUFFIX = ".part"
 
@@ -57,10 +79,11 @@ def plan_tapes(files: Iterable[Mapping]) -> list[tuple[str, int]]:
 class Progress:
     """Live numbers for the UI. Only the worker thread writes; the UI polls snapshot()."""
 
-    def __init__(self, total_bytes: int, total_files: int) -> None:
+    def __init__(self, total_bytes: int, total_files: int, steps: int = 1) -> None:
         self._lock = threading.Lock()
         self.total_bytes = total_bytes
         self.total_files = total_files
+        self.steps = steps  # each byte is moved this many times; done_bytes reports the average
         self.current_file = ""
         self.tape_id = ""
         self._finished_bytes = 0  # sizes of files already handled (restored or failed)
@@ -71,17 +94,17 @@ class Progress:
         with self._lock:
             self._inflight += n
 
-    def file_done(self, size: int) -> None:
-        """A file is finished, successfully or not."""
+    def file_done(self, size: int, files: int = 1) -> None:
+        """A file is finished, successfully or not (files=0: only one of its two steps is)."""
         with self._lock:
             self._inflight = 0
             self._finished_bytes += size
-            self._done_files += 1
+            self._done_files += files
 
     def snapshot(self) -> dict:
         with self._lock:
             return {
-                "done_bytes": max(0, min(self._finished_bytes + self._inflight, self.total_bytes)),
+                "done_bytes": max(0, min((self._finished_bytes + self._inflight) // self.steps, self.total_bytes)),
                 "total_bytes": self.total_bytes,
                 "done_files": self._done_files,
                 "total_files": self.total_files,
@@ -108,11 +131,24 @@ class Restorer:
         self.failures: list[tuple[str, str, str]] = []
         self.restored = 0
 
-        self.files = [dict(f) for f in files]  # copies, so sqlite3.Row and dict both work
-        for f in self.files:
+        self.staging_dir = os.path.join(cfg.staging_root, RESTORE_DIR)
+        self._staged: list[dict] = []  # verified on the staging disk, waiting to be delivered
+
+        # One row per destination path; the newest backup wins (rows: copies, so sqlite3.Row and dict both work).
+        newest: dict[str, dict] = {}
+        given = 0
+        for f in map(dict, files):
+            given += 1
             f["tape_id"] = normalize_tape_id(f["tape_id"])
             f["size"] = int(f["size"] or 0)
-        self.progress = Progress(sum(f["size"] for f in self.files), len(self.files))
+            f["restore_as"] = f.get("restore_as") or os.path.join(f["owner"], f["rel_path"])
+            key = os.path.normcase(f["restore_as"])
+            if key not in newest or _age(f) > _age(newest[key]):
+                newest[key] = f
+        self.files = list(newest.values())
+        self.older_versions = given - len(self.files)  # skipped: an older backup of the same file
+        # Every byte is moved twice (tape -> staging -> destination); progress counts each move as half.
+        self.progress = Progress(sum(f["size"] for f in self.files), len(self.files), steps=2)
 
     # ------------------------------------------------------------ public
 
@@ -125,14 +161,33 @@ class Restorer:
         self._stop.clear()
         self.failures = []
         self.restored = 0
+        self._staged = []
+        if not TAPE_DRIVE.acquire(blocking=False):
+            return "error", "正在备份，磁带机被占用。请等备份完成或停止后再取回。"
+        staging_made = False
         try:
+            self._check_destination()
+            self._check_space()
             try:
                 os.makedirs(long_path(self.dest_dir), exist_ok=True)
+                shutil.rmtree(long_path(self.staging_dir), ignore_errors=True)  # leftovers of a stopped run
+                os.makedirs(long_path(self.staging_dir), exist_ok=True)
+                staging_made = True
             except OSError as e:
-                raise RestoreError(f"无法使用目标文件夹 {self.dest_dir}：{e}") from e
+                raise RestoreError(f"无法使用目标文件夹或中转文件夹：{e}") from e
+            if self.older_versions:
+                self.log(f"{self.older_versions} 个文件备份过不止一次，只取最近一次备份的版本。")
 
+            # Step 1: tape -> staging, one tape at a time.
             for tape_id, _count in plan_tapes(self.files):
                 self._restore_tape(tape_id)
+            # Step 2: staging -> destination.
+            if self._staged:
+                self.log(f"磁带读取完毕，开始把 {len(self._staged)} 个文件从中转盘送到 {self.dest_dir}")
+            for row in self._staged:
+                if self._stop.is_set():
+                    raise Stopped()
+                self._deliver(row)
             message = f"取回完成：成功 {self.restored} 个文件"
             if self.failures:
                 message += f"，失败 {len(self.failures)} 个文件"
@@ -149,6 +204,41 @@ class Restorer:
             return "error", f"意外错误：{e!r}"
         finally:
             self.progress.current_file = ""
+            if staging_made:  # staging holds only copies; the tape still has everything
+                shutil.rmtree(long_path(self.staging_dir), ignore_errors=True)
+            TAPE_DRIVE.release()
+
+    def _check_destination(self) -> None:
+        """Refuse destinations where restored files could be deleted or mixed up with the program's own files."""
+        if not self.dest_dir.strip():
+            raise RestoreError("请先选择要保存到的文件夹。")
+        dest = _real(self.dest_dir)
+        for name, other in (("中转文件夹", self.staging_dir), ("磁带", self.cfg.tape_root), ("记录存放目录", self.cfg.data_dir)):
+            if _overlaps(dest, _real(other)):
+                raise RestoreError(f"不能取回到 {self.dest_dir}：它和{name}（{other}）重叠。请换一个文件夹。")
+        # The top folders the files land in must not be (inside) a backup source that is still to be deleted.
+        tops = {_real(os.path.join(self.dest_dir, f["restore_as"].split(os.sep)[0])) for f in self.files}
+        with closing(db.connect(self.cfg.db_path)) as con:
+            doomed = db.sources_to_delete(con)
+        for source in doomed:
+            if any(_overlaps(top, _real(source)) for top in tops):
+                raise RestoreError(
+                    f"不能取回到 {self.dest_dir}：{source} 正在等待“备份后删除”，取回到这里的文件会被一起删掉。"
+                    "请换一个文件夹。"
+                )
+
+    def _check_space(self) -> None:
+        need = sum(f["size"] for f in self.files)
+        try:
+            os.makedirs(long_path(self.cfg.staging_root), exist_ok=True)
+            free = shutil.disk_usage(self.cfg.staging_root).free - self.cfg.reserve_staging_bytes
+        except OSError as e:
+            raise RestoreError(f"无法使用中转盘 {self.cfg.staging_root}：{e}") from e
+        if need > free:
+            raise RestoreError(
+                f"中转盘 {self.cfg.staging_root} 空间不够：需要 {format_bytes(need)}，可用 {format_bytes(max(free, 0))}。"
+                "请少选一些，或先清理中转盘。"
+            )
 
     def log(self, text: str) -> None:
         if self._on_log:
@@ -218,7 +308,7 @@ class Restorer:
     # ------------------------------------------------------------ raw files
 
     def _restore_raw(self, row: dict) -> None:
-        dst = self._dest_path(row)
+        dst = self._staged_path(row)
         if dst is None:
             return
         tmp = dst + PART_SUFFIX
@@ -241,7 +331,7 @@ class Restorer:
         """One forward pass over the tar; stops reading as soon as every wanted member was written."""
         wanted: dict[str, dict] = {}
         for row in rows:
-            if self._dest_path(row) is not None:
+            if self._staged_path(row) is not None:
                 wanted[tar_member_name(owner, row["rel_path"])] = row
         if not wanted:
             return
@@ -279,7 +369,7 @@ class Restorer:
 
     def _extract_member(self, tar: tarfile.TarFile, member: tarfile.TarInfo, row: dict) -> None:
         """Write one member's bytes ourselves (never tar.extract), hashing as we go."""
-        dst = self._dest_path(row)
+        dst = self._staged_path(row)
         assert dst is not None
         tmp = dst + PART_SUFFIX
         src = tar.extractfile(member)
@@ -332,22 +422,54 @@ class Restorer:
             return
         if not expected:
             self.log(f"未校验（备份记录里没有校验值）：{row['owner']}\\{row['rel_path']}")
+        self._staged.append(row)
+        self.progress.file_done(row["size"], files=0)  # step 1 of 2 done
+
+    def _deliver(self, row: dict) -> None:
+        """Step 2: copy a verified file from staging to the destination, checking its SHA-256 again."""
+        src = os.path.join(self.staging_dir, row["restore_as"])
+        dst = _inside(self.dest_dir, row["restore_as"])
+        assert dst is not None  # same relative path as the staged copy, which passed the check
+        self.progress.current_file = row["restore_as"]
+        try:
+            copy_file(src, dst, should_stop=self._stop.is_set, on_bytes=self.progress.add,
+                      expect_sha=row.get("sha256") or None)
+        except HashMismatch:
+            self._fail(row, "送到目标时校验失败（中转盘读写出错？），未保存这个文件", left=row["size"])
+            return
+        except CopyError as e:
+            if e.side == "dst":
+                raise RestoreError(f"无法写入目标文件夹（磁盘已满、没有权限或网络断开？）：{e.cause}") from e
+            self._fail(row, f"无法读取中转盘上的文件（{e.cause}）", left=row["size"])
+            return
+        remove_quietly(src)  # delivered and verified: the staged copy is no longer needed
         self.restored += 1
         self.progress.file_done(row["size"])
 
-    def _fail(self, row: dict, reason: str) -> None:
+    def _fail(self, row: dict, reason: str, left: int | None = None) -> None:
+        """Record a failed file. `left`: bytes of progress still to account for (default: both steps)."""
         self.failures.append((row["owner"], row["rel_path"], reason))
         self.log(f"失败：{row['owner']}\\{row['rel_path']}：{reason}")
-        self.progress.file_done(row["size"])
+        self.progress.file_done(2 * row["size"] if left is None else left)
 
-    def _dest_path(self, row: dict) -> str | None:
-        """<dest_dir>\\<owner>\\<rel_path>, or None (and a recorded failure) if it would leave dest_dir."""
-        base = os.path.normcase(os.path.abspath(self.dest_dir))
-        path = os.path.abspath(os.path.join(self.dest_dir, row["owner"], row["rel_path"]))
-        if row["rel_path"] and os.path.normcase(path).startswith(base.rstrip(os.sep) + os.sep):
-            return path
-        self._fail(row, "文件路径不安全（会跑到目标文件夹之外），已跳过")
-        return None
+    def _staged_path(self, row: dict) -> str | None:
+        """Where step 1 puts the file, or None (and a recorded failure) if the path would leave the folder."""
+        path = _inside(self.staging_dir, row["restore_as"])
+        if path is None:
+            self._fail(row, "文件路径不安全（会跑到目标文件夹之外），已跳过")
+        return path
+
+
+def _inside(base: str, rel: str) -> str | None:
+    """<base>\\<rel>, or None if rel is empty or would lead outside base (e.g. '..\\x')."""
+    path = os.path.abspath(os.path.join(base, rel))
+    root = os.path.normcase(os.path.abspath(base)).rstrip(os.sep) + os.sep
+    return path if rel and os.path.normcase(path).startswith(root) else None
+
+
+def _age(row: Mapping) -> tuple[str, int]:
+    """Sort key: later backups are larger."""
+    return (row.get("archived_at") or "", int(row.get("job_id") or 0))
 
 
 def _source_reason(cause: BaseException | str) -> str:
