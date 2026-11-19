@@ -70,6 +70,33 @@ def test_junctions_are_not_followed(nas):
     assert {u.name: u.bytes for u in scan.done}["LiHua"] == 10000  # not the whole share again (or forever)
 
 
+def test_one_big_person_is_measured_by_several_threads(tmp_path, monkeypatch):
+    root = tmp_path / "nas"
+    for i in range(12):
+        write(root / "BigUser" / f"run{i}" / "data.raw", 1000)
+    write(root / "Small" / "x.raw", 10)
+    import threading
+    from tape_backup import nas_usage
+
+    seen: dict[str, set[int]] = {}
+    real_scandir = os.scandir
+
+    def slow_scandir(path):  # pretend every listing waits for the network
+        time.sleep(0.05)
+        seen.setdefault("BigUser" if "BigUser" in str(path) else "other", set()).add(threading.get_ident())
+        return real_scandir(path)
+
+    monkeypatch.setattr(nas_usage.os, "scandir", slow_scandir)
+    scan = NasScan(str(root), workers=4)
+    t = time.monotonic()
+    assert scan.run() == ("done", "")
+    elapsed = time.monotonic() - t
+
+    assert {u.name: (u.bytes, u.files) for u in scan.done} == {"BigUser": (12000, 12), "Small": (10, 1)}
+    assert len(seen["BigUser"]) > 1   # the subfolders of one person were shared out
+    assert elapsed < 14 * 0.05        # faster than listing its 13 folders one after another
+
+
 def test_missing_location_is_an_error(tmp_path):
     result, message = NasScan(str(tmp_path / "nope")).run()
     assert result == "error" and "找不到" in message

@@ -8,16 +8,21 @@ No UI code here:
     scan.snapshot()                  # from any thread: finished folders and running totals
 
 Only lists folders and reads file sizes (os.scandir); never opens, writes or deletes anything.
-Several folders are measured at once: on a network share most of the time is spent waiting
-for the server, so parallel listing is much faster than one folder after another.
+
+Speed: on a network share most of the time is spent waiting for the server, so several folders are
+listed at once. The unit of work is one folder at any depth, not one person: every listed subfolder
+goes back into a shared to-do stack that any idle thread takes from, so one person with most of the
+files is still measured by all threads together. The stack is last-in-first-out, so the threads
+work on the same person and finish people one after another (results appear early, little memory).
+Each person counts the folders still to list; at 0 that person is done.
 """
 
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from .copier import long_path
@@ -71,6 +76,10 @@ class NasScan:
         self.started = 0.0
         self.seconds = 0.0
         self.result: tuple[str, str] | None = None  # what run() returned, once it has
+        self._todo: queue.LifoQueue = queue.LifoQueue()  # (person, folder) still to list; None = end
+        self._usage: dict[str, FolderUsage] = {}
+        self._left: dict[str, int] = {}  # per person: folders taken or waiting, not yet listed
+        self._bug: Exception | None = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -98,55 +107,74 @@ class NasScan:
                 return "error", f"无法读取 {self.root}：{e}"
             if not self.folders:
                 return "done", f"{self.root} 下没有要统计的文件夹。"
-            with ThreadPoolExecutor(max_workers=self.workers) as pool:
-                for future in [pool.submit(self._measure, name) for name in self.folders]:
-                    future.result()  # re-raises a bug in _measure instead of hiding it
+
+            # The to-do stack holds (person, folder to list). A person is done when their count reaches 0.
+            for name in reversed(self.folders):  # reversed: the stack hands out the first name first
+                self._usage[name] = FolderUsage(name)
+                self._left[name] = 1
+                self._todo.put((name, long_path(os.path.join(self.root, name))))
+            threads = [threading.Thread(target=self._worker, daemon=True) for _ in range(self.workers)]
+            for t in threads:
+                t.start()
+            self._todo.join()  # every folder taken has been reported finished (task_done)
+            for _ in threads:
+                self._todo.put(None)  # tells each thread to end
+            for t in threads:
+                t.join()
+            if self._bug is not None:  # a programming error in a worker: don't pass off partial totals as done
+                return "error", f"统计时出现意外错误：{self._bug!r}"
             if self._stop.is_set():
                 return "stopped", ""
             return "done", ""
         finally:
             self.seconds = time.monotonic() - self.started
 
-    def _measure(self, name: str) -> None:
-        if self._stop.is_set():
-            return
-        usage = FolderUsage(name)
-        with self._lock:
-            self.running.add(name)
-        pending = [long_path(os.path.join(self.root, name))]
-        files = size = 0  # reported to the shared counters in steps, not per file
-        while pending:
-            if self._stop.is_set():
-                break
+    def _worker(self) -> None:
+        while True:
+            item = self._todo.get()
+            if item is None:
+                return
             try:
-                it = os.scandir(pending.pop())
-            except OSError:
-                usage.errors += 1
-                continue
+                if not self._stop.is_set() and self._bug is None:  # stopping: just empty the stack
+                    self._list_folder(*item)
+            except Exception as e:  # noqa: BLE001 - must still call task_done, or run() waits forever
+                self._bug = e
+            finally:
+                self._todo.task_done()
+
+    def _list_folder(self, name: str, path: str) -> None:
+        """List one folder: add up its files, put its subfolders on the to-do stack."""
+        subfolders: list[str] = []
+        files = size = errors = 0
+        try:
+            it = os.scandir(path)
+        except OSError:
+            errors += 1
+        else:
             with it:
                 for entry in it:
                     try:
                         if entry.is_dir(follow_symlinks=False):
                             if not entry.is_junction():  # links could lead in circles or out of the share
-                                pending.append(entry.path)
+                                subfolders.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
-                            n = entry.stat(follow_symlinks=False).st_size
-                            usage.bytes += n
-                            usage.files += 1
-                            size += n
+                            size += entry.stat(follow_symlinks=False).st_size  # came with the listing: no extra request
                             files += 1
                     except OSError:
-                        usage.errors += 1
-            if files >= 2000:
-                self._count(files, size)
-                files = size = 0
-        self._count(files, size)
-        with self._lock:
-            self.running.discard(name)
-            if not self._stop.is_set():  # a stopped folder's total would be too small: leave it out
-                self.done.append(usage)
-
-    def _count(self, files: int, size: int) -> None:
-        with self._lock:
+                        errors += 1
+        with self._lock:  # once per folder, not per file
+            usage = self._usage[name]
+            usage.bytes += size
+            usage.files += files
+            usage.errors += errors
             self.files_seen += files
             self.bytes_seen += size
+            self.running.add(name)
+            # Count the subfolders in before they go on the stack, so the count never reaches 0 too early.
+            self._left[name] += len(subfolders) - 1
+            if self._left[name] == 0:
+                self.running.discard(name)
+                if not self._stop.is_set():  # a stopped person's total would be too small: leave it out
+                    self.done.append(usage)
+        for sub in subfolders:
+            self._todo.put((name, sub))
